@@ -310,6 +310,49 @@ impl<'a> TableRead<'a> {
         {
             return Ok(splits.to_vec());
         }
+        if let Some(split) = splits.iter().find(|split| split.is_fallback()) {
+            let other = self
+                .table()
+                .fallback_read_table(split.snapshot_id())
+                .await?;
+            let TableReadKind::Paimon(read) = &self.kind else {
+                return Err(unsupported("fallback splits require a Paimon table"));
+            };
+            let other_read = TableRead {
+                kind: TableReadKind::Paimon(PaimonTableRead {
+                    table: &other,
+                    read_type: super::fallback_read::read_fields(self.read_type(), &other),
+                    ..read.clone()
+                }),
+                parallelism: self.parallelism,
+                ordered: self.ordered,
+            };
+            let main: Vec<_> = splits
+                .iter()
+                .filter(|split| !split.is_fallback())
+                .cloned()
+                .collect();
+            let backup: Vec<_> = splits
+                .iter()
+                .filter(|split| split.is_fallback())
+                .cloned()
+                .map(|split| split.with_fallback(false).without_query_auth_grant())
+                .collect();
+            let mut main = Box::pin(self.authorize_splits(&main)).await?.into_iter();
+            let mut backup = Box::pin(other_read.authorize_splits(&backup))
+                .await?
+                .into_iter();
+            return Ok(splits
+                .iter()
+                .map(|split| {
+                    if split.is_fallback() {
+                        backup.next().unwrap().with_fallback(true)
+                    } else {
+                        main.next().unwrap()
+                    }
+                })
+                .collect());
+        }
         let mut select: Vec<String> = self
             .read_type()
             .iter()
@@ -557,6 +600,9 @@ impl<'a> PaimonTableRead<'a> {
         ordered: bool,
         include_row_kind: bool,
     ) -> crate::Result<ArrowRecordBatchStream> {
+        if splits.iter().any(DataSplit::is_fallback) {
+            return self.execute_fallback_splits(splits, parallelism, ordered, include_row_kind);
+        }
         let options = self.table.schema().core_options();
         // Validate the complete grant set before splitting the work. Per-worker
         // validation alone could accept incompatible restricted policies.
@@ -629,6 +675,83 @@ impl<'a> PaimonTableRead<'a> {
             self.limit,
             factory,
         ))
+    }
+
+    fn execute_fallback_splits(
+        &self,
+        splits: &[DataSplit],
+        parallelism: usize,
+        ordered: bool,
+        include_row_kind: bool,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        let table = self.table.clone();
+        // Preserve branch context and authorize the complete input before
+        // each branch reader applies its partition predicate.
+        let splits = splits.to_vec();
+        let read_type = self.read_type.clone();
+        let data_predicates = self.data_predicates.clone();
+        let partition_predicate = self.partition_predicate.clone();
+        let row_filter_factory = self.row_filter_factory.clone();
+        let budget = self.parquet_read_budget()?;
+        let data_file_read_timing = self.data_file_read_timing.clone();
+        let limit = self.limit;
+        // A single quota covers both branches. Open fallback payloads only if
+        // earlier splits did not satisfy LIMIT, including lazy BLOB reads.
+        let parallelism = if limit.is_some() {
+            1
+        } else {
+            parallelism.min(MAX_TOTAL_BLOB_READS)
+        };
+        let workers = parallelism.min(splits.len()).max(1);
+        let blob_parallelism = self
+            .blob_parallelism
+            .min((MAX_TOTAL_BLOB_READS / workers).max(1));
+        let update_read = self.update_read;
+        Ok(Box::pin(async_stream::try_stream! {
+            let snapshot_id = splits.iter().find(|split| split.is_fallback()).unwrap().snapshot_id();
+            let other = table.fallback_read_table(snapshot_id).await?;
+            let main_read = PaimonTableRead {
+                table: &table, read_type, data_predicates, partition_predicate,
+                row_filter_factory, parquet_read_budget: Some(Arc::clone(&budget)),
+                resources: None, data_file_read_timing, blob_parallelism, limit, update_read,
+            };
+            let other_read = PaimonTableRead {
+                table: &other,
+                read_type: super::fallback_read::read_fields(&main_read.read_type, &other),
+                ..main_read.clone()
+            };
+            let main_splits: Vec<_> = splits.iter().filter(|s| !s.is_fallback()).cloned().collect();
+            let other_splits: Vec<_> = splits.iter().filter(|s| s.is_fallback())
+                .cloned().map(|s| s.with_fallback(false).without_query_auth_grant()).collect();
+            let authorizer = TableRead {
+                kind: TableReadKind::Paimon(other_read.clone()), parallelism, ordered,
+            };
+            let other_splits = authorizer.authorize_splits(&other_splits).await?;
+            let mut restored = other_splits.iter();
+            let splits: Vec<_> = splits.into_iter().map(|split| if split.is_fallback() {
+                restored.next().unwrap().clone().with_fallback(true)
+            } else { split }).collect();
+            // Validate each branch against its own catalog identity and schema.
+            drop(main_read.execute_splits(&main_splits, parallelism, ordered, include_row_kind)?);
+            drop(other_read.execute_splits(&other_splits, parallelism, ordered, include_row_kind)?);
+            let budget = if ordered && parallelism > 1 {
+                Arc::new(budget.without_prefetch())
+            } else { budget };
+            let main_factory = main_read.execution_factory(include_row_kind, Arc::clone(&budget), blob_parallelism);
+            let other_factory = other_read.execution_factory(include_row_kind, budget, blob_parallelism);
+            let factory: super::read_execution::SplitReader = Arc::new(move |splits, limit| {
+                if splits[0].is_fallback() {
+                    let splits: Vec<_> = splits.iter().cloned().map(|s| s.with_fallback(false)).collect();
+                    other_factory(&splits, limit)
+                } else {
+                    main_factory(splits, limit)
+                }
+            });
+            let mut stream = super::read_execution::execute(splits, parallelism, ordered, limit, factory);
+            while let Some(batch) = stream.next().await {
+                yield batch?;
+            }
+        }))
     }
 
     fn execution_factory(

@@ -53,7 +53,7 @@ impl RowPositionSelection {
         matches!(self, Self::Slice { .. })
     }
 
-    fn bounds(self, total: u64) -> (u64, u64) {
+    pub(crate) fn bounds(self, total: u64) -> (u64, u64) {
         match self {
             Self::Slice { start, end } => (start, end.min(total)),
             Self::Shard { index, count } => {
@@ -290,7 +290,7 @@ impl RowPositionSelection {
             if needs_ranges {
                 builder = builder.with_row_ranges(ranges);
             }
-            selected_splits.push(builder.build()?);
+            selected_splits.push(builder.build()?.with_read_context(&split));
             if position >= end {
                 break;
             }

@@ -63,6 +63,8 @@ use std::sync::Arc;
 mod audit;
 pub use audit::AuditLogScan;
 
+#[path = "table_scan/fallback.rs"]
+mod fallback;
 #[path = "table_scan/restore_splits.rs"]
 mod restore_splits;
 
@@ -1960,6 +1962,11 @@ impl<'a> PaimonTableScan<'a> {
             .incremental_timestamp_window()?
         {
             return scan.plan_timestamp_window(start, end, stats).await;
+        }
+        if !scan.scan_all_files && scan.file_scan_options.is_none() {
+            if let Some(plan) = scan.plan_fallback(stats).await? {
+                return Ok(plan);
+            }
         }
         let data_evolution_read_field_ids = scan.projected_read_field_ids()?;
         let plan = match super::time_travel::resolve_snapshot(&scan.table).await? {

@@ -63,6 +63,7 @@ mod dynamic_bucket_assigner;
 mod dynamic_bucket_assigner_router;
 mod dynamic_bucket_index;
 mod external_path;
+mod fallback_read;
 mod format_partition;
 mod format_partition_location;
 mod format_partition_stats;

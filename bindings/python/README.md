@@ -457,6 +457,22 @@ outputs that have not been handed off to the caller.
 Compact increments remain
 unsupported by the Rust committer and are rejected.
 
+### Batch reads with a fallback branch
+
+`table.copy({"scan.fallback-branch": "backup"})` reads the current branch first
+and adds partitions that exist only in `backup`. A data filter that rejects every
+row in a current-branch partition does not expose older rows from that partition.
+Append, primary-key and Data Evolution reads use each branch's own schema history.
+Blank, self-referencing and missing fallback branches leave ordinary reads unchanged.
+
+Snapshot-ID time travel maps the current snapshot's commit time to the fallback
+history; snapshot IDs are not shared across branches. If no sufficiently old
+fallback snapshot exists, `scan.fallback-branch.allow-earliest-snapshot=true`
+explicitly allows its earliest snapshot. An empty fallback contributes no rows.
+`Split.serialize()` preserves fallback selection using Java SplitSerializer v1
+fallback frames, including indexed splits. Writers and `plan_all()` stay scoped
+to the current branch.
+
 ### Tables resolved outside the Rust catalog
 
 `Table.from_resolved_schema(location, schema_json, *, database="default",

@@ -1447,6 +1447,62 @@ def test_unsupported_scan_option_raises_not_implemented():
             table.new_read_builder({"incremental-between": "1,2"})
 
 
+@pytest.mark.parametrize("source", ["table", "copy", "read"])
+def test_fallback_branch_scan_merges_partitions(source):
+    from pathlib import Path
+    import shutil
+    import pickle
+
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.rdb")
+        ctx.sql("CREATE TABLE paimon.rdb.t (id INT, pt STRING) PARTITIONED BY (pt)")
+        ctx.sql("INSERT INTO paimon.rdb.t VALUES (2, 'backup'), (3, 'shared')")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("rdb.t")
+        root = Path(table.location())
+        backup = root / "branch" / "branch-backup"
+        shutil.copytree(root / "schema", backup / "schema")
+        shutil.copytree(root / "snapshot", backup / "snapshot")
+        writer = table.copy({"dynamic-partition-overwrite": "false"}).new_batch_write_builder().with_overwrite()
+        write = writer.new_write()
+        write.write_arrow(pa.record_batch([pa.array([1], type=pa.int32()), pa.array(["shared"])], names=["id", "pt"]))
+        writer.new_commit().commit(write.prepare_commit())
+        assert _read_ids(table.new_read_builder()) == [1]
+        options = {"scan.fallback-branch": "backup"}
+        if source == "table":
+            schema_path = root / "schema" / "schema-0"
+            schema = json.loads(schema_path.read_text())
+            schema["options"].update(options)
+            schema_path.write_text(json.dumps(schema))
+            table = PaimonCatalog({"warehouse": warehouse}).get_table("rdb.t")
+        elif source == "copy":
+            table = table.copy(options)
+        builder = table.new_read_builder(options if source == "read" else None)
+        assert _read_ids(builder) == [1, 2]
+        splits = builder.new_scan().plan().splits()
+        for restored in ([Split.deserialize(split.serialize()) for split in splits],
+                         pickle.loads(pickle.dumps(splits))):
+            rows = pa.Table.from_batches(builder.new_read().read(restored))
+            assert sorted(rows.column("id").to_pylist()) == [1, 2]
+        # A reader can narrow a transported plan after planning. Keep main
+        # only, fallback only, or no splits without losing branch context.
+        for partition, expected in [("shared", [1]), ("backup", [2]), ("missing", [])]:
+            builder.with_filter({"method": "equal", "field": "pt", "literals": [partition]})
+            batches = builder.new_read().read(splits)
+            assert sorted(row["id"] for batch in batches for row in batch.to_pylist()) == expected
+        builder.with_filter({"method": "equal", "field": "id", "literals": [3]})
+        assert _read_ids(builder) == []
+
+
+@pytest.mark.parametrize("fallback", ["", " \t ", "main"])
+def test_fallback_branch_scan_preserves_noop_options(fallback):
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        builder = table.new_read_builder({"scan.fallback-branch": fallback})
+        assert _read_ids(builder) == [1, 2, 3]
+
+
 def test_explicit_scan_mode_with_matching_selector_reads_snapshot():
     # Java's CoreOptions.setDefaultValues() writes scan.mode=from-snapshot next
     # to scan.snapshot-id, so configs from the Java toolchain carry both keys.

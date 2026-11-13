@@ -116,7 +116,7 @@ pub(crate) async fn travel_to_snapshot(
 ///
 /// A numeric snapshot id or watermark can use table storage when the tag endpoint
 /// returns HTTP 501. Other catalog errors and tag-only versions propagate.
-async fn resolve_version_tag(
+pub(super) async fn resolve_version_tag(
     tag_manager: &TagManager,
     version: &str,
 ) -> crate::Result<Option<Snapshot>> {
@@ -315,9 +315,12 @@ mod tests {
     }
 
     async fn read_ids(table: &Table) -> Vec<i32> {
-        use futures::TryStreamExt;
-
         let builder = table.new_read_builder();
+        read_builder_ids(&builder).await
+    }
+
+    async fn read_builder_ids(builder: &crate::table::ReadBuilder<'_>) -> Vec<i32> {
+        use futures::TryStreamExt;
         let plan = builder.new_scan().plan().await.unwrap();
         let batches: Vec<RecordBatch> = builder
             .new_read()
@@ -342,6 +345,407 @@ mod tests {
             .collect::<Vec<_>>();
         ids.sort_unstable();
         ids
+    }
+
+    #[tokio::test]
+    async fn test_fallback_branch_scan_merges_partitions() {
+        check_fallback_branch("append").await;
+    }
+
+    #[tokio::test]
+    async fn test_fallback_branch_primary_key() {
+        check_fallback_branch("pk").await;
+    }
+
+    #[tokio::test]
+    async fn test_fallback_branch_data_evolution() {
+        check_fallback_branch("evolution").await;
+    }
+
+    async fn check_fallback_branch(mode: &str) {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/fallback-scan";
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .partition_keys(["value"]);
+        let schema = match mode {
+            "pk" => schema.primary_key(["id", "value"]).option("bucket", "1"),
+            "evolution" => schema
+                .option("data-evolution.enabled", "true")
+                .option("row-tracking.enabled", "true")
+                .option("bucket", "-1"),
+            _ => schema,
+        }
+        .build()
+        .unwrap();
+        let schema = TableSchema::new(0, &schema);
+        write_schema_file(&file_io, path, &schema).await;
+        let table = make_table(&file_io, path, schema);
+
+        // Retain partition 20 in backup, then replace main with partition 10.
+        // Branch writes are not supported by Rust, so create backup from a tag.
+        write_and_commit(&table, &batch_v0(vec![2, 3], vec![20, 10])).await;
+        let snapshot = table
+            .snapshot_manager()
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        table
+            .tag_manager()
+            .create("before", &snapshot)
+            .await
+            .unwrap();
+        crate::table::BranchManager::new(file_io.clone(), path.into())
+            .create_branch_from_tag("backup", "before")
+            .await
+            .unwrap();
+        let writer = table.new_write_builder().with_overwrite();
+        let mut write = writer.new_write().unwrap();
+        write
+            .write_arrow_batch(&batch_v0(vec![1], vec![10]))
+            .await
+            .unwrap();
+        let messages = write.prepare_commit().await.unwrap();
+        writer
+            .new_commit()
+            .overwrite(messages, Some(HashMap::new()))
+            .await
+            .unwrap();
+        let backup = table.copy_with_branch("backup").await.unwrap();
+        assert_eq!(read_ids(&table).await, vec![1]);
+        assert_eq!(read_ids(&backup).await, vec![2, 3]);
+
+        let fallback = table.copy_with_options(options(&[("scan.fallback-branch", "backup")]));
+        assert_eq!(read_ids(&fallback).await, vec![1, 2]);
+        let dynamic = table
+            .copy_with_time_travel(options(&[("scan.fallback-branch", "backup")]))
+            .await
+            .unwrap();
+        assert_eq!(read_ids(&dynamic).await, vec![1, 2]);
+
+        // A data predicate must not revive backup's shadowed partition 10.
+        for (id, expected) in [(2, vec![2]), (3, vec![])] {
+            let mut builder = fallback.new_read_builder();
+            builder.with_filter(
+                crate::spec::PredicateBuilder::new(fallback.schema().fields())
+                    .equal("id", crate::spec::Datum::Int(id))
+                    .unwrap(),
+            );
+            builder.with_projection(&["id"]).unwrap();
+            assert_eq!(read_builder_ids(&builder).await, expected);
+        }
+        let mut limited = fallback.new_read_builder();
+        limited.with_limit(1);
+        assert_eq!(read_builder_ids(&limited).await.len(), 1);
+
+        let builder = fallback.new_read_builder();
+        let plan = builder.new_scan().plan().await.unwrap();
+        assert!(plan.splits().iter().any(crate::DataSplit::is_fallback));
+        let splits: Vec<_> = plan
+            .splits()
+            .iter()
+            .map(|split| {
+                let bytes = split.serialize_split_v1().unwrap();
+                let restored = crate::DataSplit::deserialize_split_v1(&bytes).unwrap();
+                assert_eq!(&restored, split);
+                restored
+            })
+            .collect();
+        use futures::TryStreamExt;
+        let batches: Vec<RecordBatch> = builder
+            .new_read()
+            .unwrap()
+            .to_arrow(&splits)
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+
+        // Read-side partition pruning may retain only main, only backup, or
+        // neither branch of an already planned/transported split set.
+        for (partition, expected) in [(10, 1), (20, 1), (99, 0)] {
+            let predicate = crate::spec::PredicateBuilder::new(fallback.schema().fields())
+                .equal("value", crate::spec::Datum::Int(partition))
+                .unwrap();
+            let rows: Vec<RecordBatch> = builder
+                .new_read()
+                .unwrap()
+                .with_filter(predicate)
+                .to_arrow(&splits)
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                expected
+            );
+        }
+
+        if mode != "pk" {
+            let slice = builder
+                .new_scan()
+                .with_row_position_slice(1, 2)
+                .unwrap()
+                .plan()
+                .await
+                .unwrap();
+            let rows: Vec<RecordBatch> = builder
+                .new_read()
+                .unwrap()
+                .to_arrow(slice.splits())
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+            assert!(slice.splits().iter().all(crate::DataSplit::is_fallback));
+            let chunks = builder
+                .new_scan()
+                .with_chunk_shuffle(42, 1)
+                .unwrap()
+                .plan()
+                .await
+                .unwrap();
+            assert_eq!(chunks.splits().len(), 2);
+            let rows: Vec<RecordBatch> = builder
+                .new_read()
+                .unwrap()
+                .to_arrow(chunks.splits())
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+        }
+
+        if mode == "evolution" {
+            let mut filtered = fallback.new_read_builder();
+            filtered.with_filter(
+                crate::spec::PredicateBuilder::new(fallback.schema().fields())
+                    .equal("id", crate::spec::Datum::Int(2))
+                    .unwrap(),
+            );
+            let slice = filtered
+                .new_scan()
+                .with_row_position_slice(1, 2)
+                .unwrap()
+                .plan()
+                .await
+                .unwrap();
+            let rows: Vec<RecordBatch> = filtered
+                .new_read()
+                .unwrap()
+                .to_arrow(slice.splits())
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        }
+
+        // File/mutation scans must remain scoped to the writable branch.
+        let all = builder.new_scan().plan_all().await.unwrap();
+        assert!(all.splits().iter().all(|split| !split.is_fallback()));
+        assert_eq!(
+            all.splits()
+                .iter()
+                .map(|split| split
+                    .data_files()
+                    .iter()
+                    .map(|file| file.row_count)
+                    .sum::<i64>())
+                .sum::<i64>(),
+            1
+        );
+
+        // An empty current branch still reads every fallback partition.
+        crate::table::BranchManager::new(file_io.clone(), path.into())
+            .create_branch("empty")
+            .await
+            .unwrap();
+        let empty = table
+            .copy_with_branch("empty")
+            .await
+            .unwrap()
+            .copy_with_options(options(&[("scan.fallback-branch", "backup")]));
+        assert_eq!(read_ids(&empty).await, vec![2, 3]);
+        let empty_fallback = table.copy_with_options(options(&[("scan.fallback-branch", "empty")]));
+        assert_eq!(read_ids(&empty_fallback).await, vec![1]);
+        let reverse = backup.copy_with_options(options(&[("scan.fallback-branch", "main")]));
+        assert_eq!(read_ids(&reverse).await, vec![2, 3]);
+        let missing = table.copy_with_options(options(&[("scan.fallback-branch", "missing")]));
+        assert_eq!(read_ids(&missing).await, vec![1]);
+
+        // A fallback equal to the resolved branch does not require another scan.
+        let same_branch = backup.copy_with_options(options(&[("scan.fallback-branch", "backup")]));
+        assert_eq!(read_ids(&same_branch).await, vec![2, 3]);
+        for value in ["", " \t ", "main"] {
+            let disabled = fallback
+                .copy_with_time_travel(options(&[("scan.fallback-branch", value)]))
+                .await
+                .unwrap();
+            assert_eq!(read_ids(&disabled).await, vec![1]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fallback_branch_uses_its_own_schema_ids() {
+        use futures::TryStreamExt;
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/fallback-schema-ids";
+        let mut json = serde_json::to_value(schema_v1()).unwrap();
+        json["partitionKeys"] = serde_json::json!(["value"]);
+        let schema: TableSchema = serde_json::from_value(json.clone()).unwrap();
+        write_schema_file(&file_io, path, &schema).await;
+        let table = make_table(&file_io, path, schema);
+        write_and_commit(&table, &batch_v1(vec![2], vec![20], vec![222])).await;
+        let snapshot = table
+            .snapshot_manager()
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        table
+            .tag_manager()
+            .create("before", &snapshot)
+            .await
+            .unwrap();
+        crate::table::BranchManager::new(file_io.clone(), path.into())
+            .create_branch_from_tag("backup", "before")
+            .await
+            .unwrap();
+
+        // Both branches have schema-1, but age was re-added independently on
+        // main and has a different field ID. Schema IDs are branch-local.
+        json["fields"][2]["id"] = serde_json::json!(3);
+        json["highestFieldId"] = serde_json::json!(3);
+        let schema: TableSchema = serde_json::from_value(json).unwrap();
+        write_schema_file(&file_io, path, &schema).await;
+        let main = make_table(&file_io, path, schema);
+        let writer = main.new_write_builder().with_overwrite();
+        let mut write = writer.new_write().unwrap();
+        write
+            .write_arrow_batch(&batch_v1(vec![1], vec![10], vec![111]))
+            .await
+            .unwrap();
+        let messages = write.prepare_commit().await.unwrap();
+        writer
+            .new_commit()
+            .overwrite(messages, Some(HashMap::new()))
+            .await
+            .unwrap();
+        let fallback = main.copy_with_options(options(&[("scan.fallback-branch", "backup")]));
+        let mut builder = fallback.new_read_builder();
+        builder.with_projection(&["age"]).unwrap();
+        builder.with_filter(
+            crate::spec::PredicateBuilder::new(fallback.schema().fields())
+                .equal("age", crate::spec::Datum::Int(222))
+                .unwrap(),
+        );
+        let plan = builder.new_scan().plan().await.unwrap();
+        assert_eq!(plan.splits().len(), 1);
+        assert!(plan.splits()[0].is_fallback());
+        let split =
+            crate::DataSplit::deserialize_split_v1(&plan.splits()[0].serialize_split_v1().unwrap())
+                .unwrap();
+        let batches: Vec<RecordBatch> = builder
+            .new_read()
+            .unwrap()
+            .to_arrow(&[split])
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        let ages: Vec<_> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(ages, vec![Some(222)]);
+    }
+
+    #[tokio::test]
+    async fn test_fallback_branch_snapshot_time_is_not_a_shared_id() {
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let path = "memory:/fallback-times";
+        let schema = schema_v0();
+        write_schema_file(&file_io, path, &schema).await;
+        let table = make_table(&file_io, path, schema);
+        write_and_commit(&table, &batch_v0(vec![2], vec![20])).await;
+        let snapshot = table
+            .snapshot_manager()
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        table
+            .tag_manager()
+            .create("before", &snapshot)
+            .await
+            .unwrap();
+        crate::table::BranchManager::new(file_io.clone(), path.into())
+            .create_branch_from_tag("backup", "before")
+            .await
+            .unwrap();
+        // Snapshot 1 has different commit times in two independent histories.
+        for (directory, time) in [
+            (path.to_string(), 100),
+            (format!("{path}/branch/branch-backup"), 200),
+        ] {
+            let mut json = serde_json::to_value(&snapshot).unwrap();
+            json["timeMillis"] = serde_json::json!(time);
+            file_io
+                .new_output(&format!("{directory}/snapshot/snapshot-1"))
+                .unwrap()
+                .write(serde_json::to_vec(&json).unwrap().into())
+                .await
+                .unwrap();
+        }
+        let fallback = table
+            .copy_with_time_travel_strict(options(&[
+                ("scan.fallback-branch", "backup"),
+                ("scan.snapshot-id", "1"),
+            ]))
+            .await
+            .unwrap();
+        let error = fallback
+            .new_read_builder()
+            .new_scan()
+            .plan()
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("allow-earliest-snapshot"),
+            "{error}"
+        );
+        let allowed = fallback.copy_with_options(options(&[(
+            "scan.fallback-branch.allow-earliest-snapshot",
+            "true",
+        )]));
+        assert_eq!(read_ids(&allowed).await, vec![2]);
+        // Numeric tag names must be resolved as tags, not remapped as IDs.
+        table.tag_manager().create("1", &snapshot).await.unwrap();
+        let other = table.copy_with_branch("backup").await.unwrap();
+        other.tag_manager().create("1", &snapshot).await.unwrap();
+        let tagged = table
+            .copy_with_time_travel_strict(options(&[
+                ("scan.fallback-branch", "backup"),
+                ("scan.version", "1"),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(read_ids(&tagged).await, vec![2]);
     }
 
     /// Table with two schema versions and one snapshot per version:

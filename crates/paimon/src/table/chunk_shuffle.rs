@@ -66,6 +66,7 @@ struct InputFile {
 
 #[derive(Debug)]
 struct InputGroup {
+    read_context: DataSplit,
     partition: BinaryRow,
     bucket: i32,
     bucket_path: String,
@@ -206,6 +207,7 @@ fn flatten_groups(splits: Vec<DataSplit>) -> crate::Result<Vec<InputGroup>> {
         let deletion_files = split.data_deletion_files();
         let key = (split.partition().to_serialized_bytes(), split.bucket());
         let group = grouped.entry(key).or_insert_with(|| InputGroup {
+            read_context: split.clone(),
             partition: split.partition().clone(),
             bucket: split.bucket(),
             bucket_path: split.bucket_path().to_string(),
@@ -318,7 +320,7 @@ fn build_append_split(
     if deletion_files.iter().any(Option::is_some) {
         builder = builder.with_data_deletion_files(deletion_files);
     }
-    builder.build()
+    Ok(builder.build()?.with_read_context(&group.read_context))
 }
 
 async fn evolution_chunks(
@@ -460,7 +462,7 @@ fn build_evolution_split(
     if deletion_files.iter().any(Option::is_some) {
         builder = builder.with_data_deletion_files(deletion_files);
     }
-    builder.build()
+    Ok(builder.build()?.with_read_context(&group.read_context))
 }
 
 fn base_builder(group: &InputGroup, files: Vec<DataFileMeta>, raw: bool) -> DataSplitBuilder {
