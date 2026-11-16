@@ -284,6 +284,25 @@ for batch in batches:
     print(batch)
 ```
 
+### Batch Reads with a Fallback Branch
+
+Use `scan.fallback-branch` to read missing partitions from another branch of the
+same table. The current branch takes precedence for each partition it contains.
+Append, primary-key, and Data Evolution tables are supported.
+
+```python
+table = catalog.get_table("default.my_table")
+fallback = table.copy({"scan.fallback-branch": "backup"})
+
+# Plan and read with the same table handle.
+rb = fallback.new_read_builder()
+plan = rb.new_scan().plan()
+batches = rb.new_read().read(plan.splits())
+```
+
+See [Fallback Branch Reading](fallback-branch.md) for partition precedence,
+schema requirements, snapshot selection, and supported operations.
+
 ## Extracting VARIANT Values
 
 `pypaimon_rust.data.variant_get` extracts one path from a PyArrow VARIANT array

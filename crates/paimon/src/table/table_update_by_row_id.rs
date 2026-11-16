@@ -47,6 +47,11 @@ impl RowIdPlan {
         }
         let mut groups = Vec::new();
         for split in plan.splits() {
+            if split.is_fallback() {
+                return Err(invalid(
+                    "A row-ID mutation plan cannot contain fallback splits",
+                ));
+            }
             if Some(split.snapshot_id()) != plan.snapshot_id()
                 || split.is_streaming()
                 || split.row_ranges().is_some()

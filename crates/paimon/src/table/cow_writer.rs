@@ -150,7 +150,9 @@ impl CopyOnWriteMergeWriter {
             None
         };
         let scan = TableScan::new(table, partition_filter, vec![], None, None, None);
-        let plan = scan.plan().await?;
+        // Rewrites target complete current-branch files and require unrestricted
+        // authorization, even when this table also supports fallback reads.
+        let plan = scan.plan_all().await?;
 
         let mut file_index = Vec::new();
         for split in plan.splits() {

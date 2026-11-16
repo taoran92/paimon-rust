@@ -539,12 +539,20 @@ async fn test_delete_rejects_data_evolution_table_without_deletion_vectors() {
         .await
         .unwrap();
 
-    assert_sql_error(
+    let delete = "DELETE FROM paimon.test_db.de_t WHERE id = 1";
+    let required_option = "requires 'deletion-vectors.enabled' = 'true'";
+    exec(
         &sql_context,
-        "DELETE FROM paimon.test_db.de_t WHERE id = 1",
-        "deletion-vectors.enabled",
+        "INSERT INTO paimon.test_db.de_t (id, name) VALUES (1, 'first')",
     )
     .await;
+    assert_sql_error(&sql_context, delete, required_option).await;
+    exec(
+        &sql_context,
+        "SET 'paimon.deletion-vectors.enabled' = 'true'",
+    )
+    .await;
+    assert_sql_error(&sql_context, delete, required_option).await;
     drop(tmp);
 }
 

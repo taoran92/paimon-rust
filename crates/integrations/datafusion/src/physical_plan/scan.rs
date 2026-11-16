@@ -1023,6 +1023,18 @@ impl PaimonTableScan {
             return Statistics::unknown_column(&self.schema());
         }
 
+        if partitions
+            .iter()
+            .flat_map(|splits| splits.iter())
+            .any(DataSplit::is_fallback)
+        {
+            // Schema and field IDs are branch-local. Applying main's schema to
+            // fallback files can mistake a dropped column's stats for a new one.
+            // Keep column counts and bounds unknown until they can be resolved
+            // with the source branch's read schema; split row counts remain valid.
+            return Statistics::unknown_column(&self.schema());
+        }
+
         let Ok(merge_engine) = self.table.schema().core_options().merge_engine() else {
             return Statistics::unknown_column(&self.schema());
         };
@@ -1299,8 +1311,14 @@ impl ExecutionPlan for PaimonTableScan {
             .map(|result| result.filter)
             .collect::<Vec<_>>();
         // A query-auth read refuses a decoder filter; the filter above sees only what it admits.
+        // A fallback branch may require authorization even when the current branch does not.
         if filters.is_empty()
             || CoreOptions::new(self.table.schema().options()).query_auth_enabled()
+            || self
+                .planned_partitions
+                .iter()
+                .flat_map(|splits| splits.iter())
+                .any(DataSplit::query_auth_required)
         {
             return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
                 vec![PushedDown::No; filters.len()],
@@ -1894,6 +1912,51 @@ mod tests {
                 Precision::Inexact(ScalarValue::Int32(Some(max)))
             );
             assert_eq!(id.null_count, Precision::Exact(nulls));
+        }
+    }
+
+    #[test]
+    fn test_fallback_statistics_keep_rows_but_not_main_schema_column_stats() {
+        let split = split_with_int_stats(None, None);
+        // Decode a public type-6 FallbackDataSplit frame (header, body, branch flag).
+        let mut frame = split.serialize_split_v1().unwrap();
+        frame[12..16].copy_from_slice(&6_i32.to_be_bytes());
+        frame.push(1);
+        let fallback = DataSplit::deserialize_split_v1(&frame).unwrap();
+        let scan = PaimonTableScan::new(
+            test_schema(),
+            dummy_table(),
+            test_read_type(),
+            None,
+            vec![Arc::from(vec![split]), Arc::from(vec![fallback])],
+            None,
+            true,
+            None,
+            None,
+            true,
+        );
+        for partition in [None, Some(0), Some(1)] {
+            let statistics = scan
+                .statistics_from_inputs(&[], &StatisticsArgs::new().with_partition(partition))
+                .unwrap();
+            assert_eq!(
+                statistics.num_rows,
+                Precision::Exact(if partition.is_none() { 8 } else { 4 })
+            );
+            let column = &statistics.column_statistics[0];
+            if partition == Some(0) {
+                // A main-only partition can still expose its own column statistics.
+                assert_eq!(column.null_count, Precision::Exact(1));
+                assert_eq!(
+                    column.min_value,
+                    Precision::Inexact(ScalarValue::Int32(Some(1)))
+                );
+            } else {
+                // Equal schema IDs do not make backup's column identity trustworthy.
+                assert_eq!(column.null_count, Precision::Absent);
+                assert_eq!(column.min_value, Precision::Absent);
+                assert_eq!(column.max_value, Precision::Absent);
+            }
         }
     }
 

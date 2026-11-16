@@ -753,6 +753,45 @@ async fn explicit_file_filters_include_level_zero_with_key_merge() {
 }
 
 #[tokio::test]
+async fn fallback_file_filters_do_not_erase_partition_ownership() {
+    let main = table("fallback_file_filters", "deduplicate", "none", 1).await;
+    crate::table::BranchManager::new(main.file_io().clone(), main.location().into())
+        .create_branch("backup")
+        .await
+        .unwrap();
+    let backup = main.copy_with_branch("backup").await.unwrap();
+    let builder = backup.new_write_builder();
+    let mut writer = builder.new_write().unwrap();
+    writer
+        .write_arrow_batch(&make_batch(vec![2], vec![20]))
+        .await
+        .unwrap();
+    let mut messages = writer.prepare_commit().await.unwrap();
+    for message in &mut messages {
+        for file in &mut message.new_files {
+            file.level = 1;
+        }
+    }
+    builder.new_commit().commit(messages).await.unwrap();
+    write_batch(&main, &make_batch(vec![1], vec![10])).await;
+    let fallback = main.copy_with_options(HashMap::from([(
+        "scan.fallback-branch".into(),
+        "backup".into(),
+    )]));
+    // The unpartitioned main table owns the only partition even when its L0
+    // files are excluded. Backup's L1 row must not be resurrected.
+    let plan = fallback
+        .new_read_builder()
+        .new_scan()
+        .with_file_filters(true, false)
+        .unwrap()
+        .plan()
+        .await
+        .unwrap();
+    assert!(plan.splits().is_empty());
+}
+
+#[tokio::test]
 async fn file_scan_preserves_compacted_key_merge_inputs() {
     for engine in ["deduplicate", "partial-update", "aggregation"] {
         let table = table(&format!("file_merge_inputs_{engine}"), engine, "none", 1).await;

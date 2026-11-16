@@ -53,7 +53,7 @@ impl RowPositionSelection {
         matches!(self, Self::Slice { .. })
     }
 
-    fn bounds(self, total: u64) -> (u64, u64) {
+    pub(crate) fn bounds(self, total: u64) -> (u64, u64) {
         match self {
             Self::Slice { start, end } => (start, end.min(total)),
             Self::Shard { index, count } => {
@@ -153,7 +153,7 @@ impl RowPositionSelection {
     pub(crate) fn select_append_splits(
         self,
         splits: Vec<DataSplit>,
-        row_tracking_enabled: bool,
+        row_tracking_enabled: impl Fn(&DataSplit) -> bool,
     ) -> Result<Vec<DataSplit>> {
         let mut total = 0u64;
         for split in &splits {
@@ -179,6 +179,9 @@ impl RowPositionSelection {
         let mut position = 0u64;
         let mut selected_splits = Vec::new();
         for split in splits {
+            // The position domain spans both branches, but each reader expects
+            // ranges in its own layout: global row IDs or split-local offsets.
+            let row_tracking_enabled = row_tracking_enabled(&split);
             let mut files = Vec::new();
             let mut deletion_files = split.data_deletion_files().map(|_| Vec::new());
             let mut ranges = Vec::new();
@@ -290,7 +293,7 @@ impl RowPositionSelection {
             if needs_ranges {
                 builder = builder.with_row_ranges(ranges);
             }
-            selected_splits.push(builder.build()?);
+            selected_splits.push(builder.build()?.with_read_context(&split));
             if position >= end {
                 break;
             }
@@ -404,7 +407,7 @@ mod tests {
 
         let selected = RowPositionSelection::slice(4, 6)
             .unwrap()
-            .select_append_splits(vec![input], false)
+            .select_append_splits(vec![input], |_| false)
             .unwrap();
 
         assert_eq!(selected.len(), 1);
@@ -443,7 +446,7 @@ mod tests {
 
         let selected = RowPositionSelection::slice(2, 5)
             .unwrap()
-            .select_append_splits(vec![input], true)
+            .select_append_splits(vec![input], |_| true)
             .unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(
@@ -474,7 +477,7 @@ mod tests {
         for index in 0..4 {
             let selected = RowPositionSelection::shard(index, 4)
                 .unwrap()
-                .select_append_splits(inputs.clone(), false)
+                .select_append_splits(inputs.clone(), |_| false)
                 .unwrap();
             counts.push(selected.iter().map(DataSplit::row_count).sum::<i64>());
         }
@@ -495,7 +498,7 @@ mod tests {
         );
         let selected = RowPositionSelection::slice(2, 5)
             .unwrap()
-            .select_append_splits(vec![input], true)
+            .select_append_splits(vec![input], |_| true)
             .unwrap();
         assert_eq!(pairs(selected[0].row_ranges()), Some(vec![(201, 201)]));
     }
@@ -514,13 +517,13 @@ mod tests {
         );
         assert!(RowPositionSelection::slice(0, 1)
             .unwrap()
-            .select_append_splits(vec![unknown], false)
+            .select_append_splits(vec![unknown], |_| false)
             .is_err());
 
         let missing_id = split(1, vec![file("missing.parquet", 1, None)], None, None);
         assert!(RowPositionSelection::slice(0, 1)
             .unwrap()
-            .select_append_splits(vec![missing_id], true)
+            .select_append_splits(vec![missing_id], |_| true)
             .is_err());
     }
 

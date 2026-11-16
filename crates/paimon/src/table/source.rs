@@ -500,6 +500,10 @@ impl PartitionBucket {
 /// Reference: [org.apache.paimon.table.source.DataSplit](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/table/source/DataSplit.java)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DataSplit {
+    /// Read this split with the configured fallback branch's schema history.
+    /// Carried by Java's FallbackDataSplit/FallbackSplit wire wrappers.
+    #[serde(default)]
+    is_fallback: bool,
     snapshot_id: i64,
     partition: Arc<BinaryRow>,
     bucket: i32,
@@ -537,6 +541,28 @@ pub struct DataSplit {
 }
 
 impl DataSplit {
+    pub fn is_fallback(&self) -> bool {
+        self.is_fallback
+    }
+
+    pub(crate) fn with_fallback(mut self, fallback: bool) -> Self {
+        self.is_fallback = fallback;
+        self
+    }
+
+    pub(crate) fn without_query_auth_grant(mut self) -> Self {
+        self.query_auth_grant = None;
+        self
+    }
+
+    pub(crate) fn with_read_context(mut self, source: &Self) -> Self {
+        self.is_fallback = source.is_fallback;
+        self.query_auth_grant = source.query_auth_grant.clone();
+        self.query_auth_required = source.query_auth_required;
+        self.query_auth_response = source.query_auth_response.clone();
+        self
+    }
+
     /// Whether files contain change events rather than a materialized snapshot.
     pub fn is_streaming(&self) -> bool {
         self.is_streaming
@@ -551,7 +577,9 @@ impl DataSplit {
         self
     }
 
-    pub(crate) fn query_auth_required(&self) -> bool {
+    /// Whether reading this split requires catalog query authorization, even
+    /// when its grant has no row filters or column masks.
+    pub fn query_auth_required(&self) -> bool {
         self.query_auth_required
     }
 
@@ -876,6 +904,13 @@ impl DataSplit {
     /// format; `serialize_split_v1` wraps a row-range split as an `IndexedSplit` instead.
     pub fn serialize(&self) -> crate::Result<Vec<u8>> {
         self.ensure_serializable_without_grant()?;
+        if self.is_fallback {
+            return Err(crate::Error::Unsupported {
+                message:
+                    "DataSplit bytes cannot retain the fallback branch; use serialize_split_v1"
+                        .into(),
+            });
+        }
         let mut out = Vec::new();
         out.extend_from_slice(&SPLIT_MAGIC.to_be_bytes());
         out.extend_from_slice(&SPLIT_VERSION.to_be_bytes());
@@ -1045,6 +1080,26 @@ impl DataSplit {
     /// Serialize aligned vector scores using Java's IndexedSplit wire format.
     /// Scores belong to the selection, in ascending expanded-range order.
     pub fn serialize_split_v1_with_scores(&self, scores: Option<&[f32]>) -> crate::Result<Vec<u8>> {
+        if let Some(scores) = scores {
+            validate_scores(self.row_ranges(), scores)?;
+        }
+        if self.is_fallback {
+            // Java selects the branch from the outer split before applying authorization.
+            let metadata = self.clone().with_fallback(false);
+            let mut out = Vec::new();
+            out.extend_from_slice(&SPLIT_SER_MAGIC.to_be_bytes());
+            out.extend_from_slice(&SPLIT_SER_VERSION.to_be_bytes());
+            if self.row_ranges.is_none() && !self.query_auth_required {
+                out.extend_from_slice(&SPLIT_SER_TYPE_FALLBACK_DATA_SPLIT.to_be_bytes()); // FallbackDataSplit
+                out.extend_from_slice(&metadata.serialize()?);
+                out.push(1);
+            } else {
+                out.extend_from_slice(&SPLIT_SER_TYPE_FALLBACK_SPLIT.to_be_bytes()); // FallbackSplit
+                out.push(1);
+                out.extend_from_slice(&metadata.serialize_split_v1_with_scores(scores)?);
+            }
+            return Ok(out);
+        }
         if self.query_auth_required {
             let response = self
                 .query_auth_grant
@@ -1070,9 +1125,6 @@ impl DataSplit {
             return Ok(out);
         }
         self.ensure_serializable_without_grant()?;
-        if let Some(scores) = scores {
-            validate_scores(self.row_ranges(), scores)?;
-        }
         let mut out = Vec::new();
         out.extend_from_slice(&SPLIT_SER_MAGIC.to_be_bytes());
         out.extend_from_slice(&SPLIT_SER_VERSION.to_be_bytes());
@@ -1110,7 +1162,7 @@ impl DataSplit {
     /// Reverse of [`DataSplit::serialize_split_v1`]: parse a Java `SplitSerializer` frame into a
     /// `DataSplit` (type 1), an `IndexedSplit` (type 3, which carries `row_ranges`), or a
     /// `QueryAuthSplit` (type 5, retaining the authorization-required marker without minting
-    /// a grant). IndexedSplit scores retain their range alignment. Other type ids are unsupported.
+    /// a grant). IndexedSplit scores retain their range alignment. FallbackDataSplit (type 6) and FallbackSplit (type 7) retain branch selection. Other type ids are unsupported.
     /// Consumes the entire buffer.
     pub fn deserialize_split_v1(data: &[u8]) -> crate::Result<DataSplit> {
         let mut cur = data;
@@ -1146,6 +1198,14 @@ impl DataSplit {
         }
         let type_id = read_i32(cur)?;
         let split = match type_id {
+            SPLIT_SER_TYPE_FALLBACK_DATA_SPLIT => {
+                let split = Self::read_body(cur)?;
+                split.with_fallback(read_u8(cur)? != 0)
+            }
+            SPLIT_SER_TYPE_FALLBACK_SPLIT => {
+                let fallback = read_u8(cur)? != 0;
+                Self::read_split_v1(cur, depth + 1)?.with_fallback(fallback)
+            }
             SPLIT_SER_TYPE_QUERY_AUTH_SPLIT => {
                 let split = Self::read_split_v1(cur, depth + 1)?;
                 let response = read_auth_response(cur)?;
@@ -1247,6 +1307,8 @@ const SPLIT_SER_VERSION: i32 = 1;
 const SPLIT_SER_TYPE_DATA_SPLIT: i32 = 1;
 const SPLIT_SER_TYPE_INDEXED_SPLIT: i32 = 3;
 const SPLIT_SER_TYPE_QUERY_AUTH_SPLIT: i32 = 5;
+const SPLIT_SER_TYPE_FALLBACK_DATA_SPLIT: i32 = 6;
+const SPLIT_SER_TYPE_FALLBACK_SPLIT: i32 = 7;
 
 fn write_auth_response(
     out: &mut Vec<u8>,
@@ -1653,6 +1715,7 @@ impl DataSplitBuilder {
             }
         }
         Ok(DataSplit {
+            is_fallback: false,
             query_auth_grant: None,
             query_auth_required: false,
             query_auth_response: None,
@@ -3001,6 +3064,89 @@ mod tests {
         assert_eq!(restored.total_buckets(), 1);
         assert_eq!(restored.total_buckets, None);
         assert_eq!(restored.serialize_split_v1().unwrap(), bytes);
+    }
+
+    #[test]
+    fn fallback_split_wire_frames_preserve_selection() {
+        for indexed in [false, true] {
+            let mut builder = v1_data_split_builder();
+            if indexed {
+                builder = builder.with_row_ranges(vec![RowRange::new(1, 2)]);
+            }
+            let plain = builder.build().unwrap();
+            let wrapped = plain.clone().with_fallback(true);
+            assert!(wrapped.serialize().is_err());
+            // Wrapping must not discard invalid scores on a non-indexed split,
+            // or bypass the indexed split's range/score alignment checks.
+            assert!(wrapped
+                .serialize_split_v1_with_scores(Some(&[1.0]))
+                .is_err());
+            let bytes = wrapped.serialize_split_v1().unwrap();
+            assert_eq!(
+                i32::from_be_bytes(bytes[12..16].try_into().unwrap()),
+                if indexed {
+                    SPLIT_SER_TYPE_FALLBACK_SPLIT
+                } else {
+                    SPLIT_SER_TYPE_FALLBACK_DATA_SPLIT
+                }
+            );
+            assert_eq!(DataSplit::deserialize_split_v1(&bytes).unwrap(), wrapped);
+            // Independently construct Java's wrappers around existing golden bodies.
+            let mut expected = bytes[..16].to_vec();
+            if indexed {
+                expected.push(1);
+                expected.extend(plain.serialize_split_v1().unwrap());
+            } else {
+                expected.extend(plain.serialize().unwrap());
+                expected.push(1);
+            }
+            assert_eq!(bytes, expected);
+            for length in [16, bytes.len() - 1] {
+                assert!(DataSplit::deserialize_split_v1(&bytes[..length]).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn fallback_query_auth_split_wire_roundtrip_preserves_java_routing() {
+        // Java routes on the outer FallbackSplit before applying QueryAuthSplit's rules.
+        for indexed in [false, true] {
+            let mut builder = v1_data_split_builder();
+            if indexed {
+                builder = builder.with_row_ranges(vec![RowRange::new(1, 2)]);
+            }
+            let scores = [0.75, 0.5];
+            let plain = builder.build().unwrap();
+            let grant =
+                QueryAuthGrant::parse(&crate::api::AuthTableQueryResponse::default(), 1, None, &[])
+                    .unwrap();
+            let authorized = plain.planned(Some(Arc::new(grant)));
+            let scores = indexed.then_some(scores.as_slice());
+            let mut expected = Vec::new();
+            expected.extend_from_slice(&SPLIT_SER_MAGIC.to_be_bytes());
+            expected.extend_from_slice(&SPLIT_SER_VERSION.to_be_bytes());
+            expected.extend_from_slice(&SPLIT_SER_TYPE_FALLBACK_SPLIT.to_be_bytes());
+            expected.push(1);
+            expected.extend_from_slice(&authorized.serialize_split_v1_with_scores(scores).unwrap());
+
+            let fallback = authorized.with_fallback(true);
+            assert_eq!(
+                fallback.serialize_split_v1_with_scores(scores).unwrap(),
+                expected
+            );
+            let restored = DataSplit::deserialize_split_v1(&expected).unwrap();
+            assert!(restored.is_fallback());
+            assert!(restored.query_auth_required());
+            assert!(restored.query_auth_grant().is_none());
+            assert!(restored.serialize().is_err());
+            assert_eq!(restored.row_ranges(), fallback.row_ranges());
+            assert_eq!(restored.scores(), scores);
+            assert_eq!(restored.serialize_split_v1().unwrap(), expected);
+            assert!(fallback
+                .serialize_split_v1_with_scores(Some(&[1.0]))
+                .is_err());
+            assert!(fallback.planned(None).serialize_split_v1().is_err());
+        }
     }
 
     #[test]

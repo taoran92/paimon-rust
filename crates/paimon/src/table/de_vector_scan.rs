@@ -124,7 +124,7 @@ impl Table {
     }
 
     /// Resolve a scalar predicate once and pin all later vector-search/read
-    /// stages to the same snapshot.
+    /// stages to the same snapshot in the current branch, without fallback.
     pub async fn prepare_vector_search_filter(
         &self,
         filter: Predicate,

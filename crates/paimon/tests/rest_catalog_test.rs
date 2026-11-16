@@ -5521,6 +5521,344 @@ async fn test_query_auth_asks_about_the_projection_and_the_columns_filters_read(
 
 #[cfg(not(windows))]
 #[tokio::test]
+async fn test_fallback_query_auth_keeps_branch_rule_columns_separate() {
+    let schema = |options: &[(&str, &str)]| {
+        let mut builder = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("pt", DataType::Int(IntType::new()))
+            .column("secret", DataType::Int(IntType::new()))
+            .partition_keys(["pt"]);
+        for (key, value) in options {
+            builder = builder.option(*key, *value);
+        }
+        builder.build().unwrap()
+    };
+    let g = written("fallback_rules", schema, vec![]).await;
+    let mut options = Options::new();
+    options.set(CatalogOptions::WAREHOUSE, g._tmp.path().to_str().unwrap());
+    let catalog = FileSystemCatalog::new(options).unwrap();
+    let main = catalog.get_table(&g.identifier).await.unwrap();
+    paimon::table::BranchManager::new(main.file_io().clone(), main.location().into())
+        .create_branch("backup")
+        .await
+        .unwrap();
+    let backup = main.copy_with_branch("backup").await.unwrap();
+    let batch = |id: Vec<i32>, pt: Vec<i32>, secret: Vec<i32>| {
+        RecordBatch::try_from_iter([
+            (
+                "id",
+                Arc::new(Int32Array::from(id)) as arrow_array::ArrayRef,
+            ),
+            ("pt", Arc::new(Int32Array::from(pt))),
+            ("secret", Arc::new(Int32Array::from(secret))),
+        ])
+        .unwrap()
+    };
+    write_batch(&main, batch(vec![1, 4], vec![10, 10], vec![1, 0]), "main").await;
+    write_batch(
+        &backup,
+        batch(vec![2, 3], vec![20, 20], vec![0, 1]),
+        "backup",
+    )
+    .await;
+    g.ctx.server.add_table_with_schema(
+        "default",
+        "fallback_rules$branch_backup",
+        schema(GUARDED),
+        main.location(),
+    );
+    g.ctx
+        .server
+        .set_column_auth("default", "fallback_rules$branch_backup", vec!["id".into()]);
+    g.set_rules(&[int_leaf(2, "secret", "EQUAL", 1)], &[]);
+
+    let backup = g.table.copy_with_branch("backup").await.unwrap();
+    let fallback = g.table.copy_with_options(HashMap::from([(
+        "scan.fallback-branch".into(),
+        "backup".into(),
+    )]));
+    for (table, expected) in [
+        (&g.table, vec![1]),
+        (&backup, vec![2, 3]),
+        (&fallback, vec![1, 2, 3]),
+    ] {
+        let mut builder = table.new_read_builder();
+        builder.with_projection(&["id"]).unwrap();
+        let reader = builder.new_read().unwrap();
+        let plan = builder.new_scan().plan().await.unwrap();
+        let restored = plan
+            .splits()
+            .iter()
+            .map(|split| {
+                paimon::DataSplit::deserialize_split_v1(&split.serialize_split_v1().unwrap())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        // Wire metadata carries rules but no live grant; restore it through the catalog.
+        let restored = reader.authorize_splits(&restored).await.unwrap();
+        for splits in [plan.splits(), restored.as_slice()] {
+            let batches = reader
+                .to_arrow(splits)
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap();
+            assert_eq!(ids(&batches), expected);
+        }
+    }
+    // Rule-only dependencies belong to main, not to backup's requested select.
+    let requests = g
+        .ctx
+        .server
+        .auth_selects("default", "fallback_rules$branch_backup");
+    assert!(!requests.is_empty());
+    assert!(requests
+        .iter()
+        .all(|columns| columns.as_deref() == Some(&["id".to_string()])));
+
+    // A user explicitly requesting the same column must still be denied.
+    let mut projected = fallback.new_read_builder();
+    projected.with_projection(&["id", "secret"]).unwrap();
+    assert_forbidden(read_all(&projected).await.unwrap_err());
+    let mut filtered = fallback.new_read_builder();
+    filtered.with_projection(&["id"]).unwrap().with_filter(
+        PredicateBuilder::new(fallback.schema().fields())
+            .equal("secret", Datum::Int(1))
+            .unwrap(),
+    );
+    assert_forbidden(read_all(&filtered).await.unwrap_err());
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_fallback_query_auth_partition_masks_preserve_ownership() {
+    for (primary_key, data_evolution, main_auth) in [
+        (false, false, true),
+        (true, false, true),
+        (false, true, true),
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+    ] {
+        let schema = |options: &[(&str, &str)]| {
+            let mut builder = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("pt", DataType::VarChar(VarCharType::new(255).unwrap()))
+                .partition_keys(["pt"]);
+            if primary_key {
+                builder = builder.primary_key(["pt", "id"]).option("bucket", "1");
+            }
+            if data_evolution {
+                builder = builder
+                    .option("data-evolution.enabled", "true")
+                    .option("row-tracking.enabled", "true");
+            }
+            for (key, value) in options {
+                builder = builder.option(*key, *value);
+            }
+            builder.build().unwrap()
+        };
+        let g = written("fallback_masks", schema, vec![]).await;
+        let mut options = Options::new();
+        options.set(CatalogOptions::WAREHOUSE, g._tmp.path().to_str().unwrap());
+        let catalog = FileSystemCatalog::new(options).unwrap();
+        let main = catalog.get_table(&g.identifier).await.unwrap();
+        paimon::table::BranchManager::new(main.file_io().clone(), main.location().into())
+            .create_branch("backup")
+            .await
+            .unwrap();
+        let backup = main.copy_with_branch("backup").await.unwrap();
+        let batch = |id: Vec<i32>, pt: Vec<&str>| {
+            RecordBatch::try_from_iter([
+                (
+                    "id",
+                    Arc::new(Int32Array::from(id)) as arrow_array::ArrayRef,
+                ),
+                ("pt", Arc::new(StringArray::from(pt))),
+            ])
+            .unwrap()
+        };
+        write_batch(&main, batch(vec![1, 4], vec!["shared", "main"]), "main").await;
+        write_batch(&backup, batch(vec![2, 3], vec!["eng", "shared"]), "backup").await;
+        g.ctx.server.add_table_with_schema(
+            "default",
+            "fallback_masks$branch_backup",
+            schema(GUARDED),
+            main.location(),
+        );
+        if !main_auth {
+            g.ctx.server.add_table_with_schema(
+                "default",
+                "fallback_masks",
+                schema(&[]),
+                main.location(),
+            );
+        }
+        let main = g.ctx.catalog.get_table(&g.identifier).await.unwrap();
+        let backup = main.copy_with_branch("backup").await.unwrap();
+        let fallback = main.copy_with_options(HashMap::from([(
+            "scan.fallback-branch".into(),
+            "backup".into(),
+        )]));
+        let predicates = PredicateBuilder::new(fallback.schema().fields());
+        let equals = |value: &str| predicates.equal("pt", Datum::String(value.into())).unwrap();
+        for (main_mask, backup_mask) in [(false, true), (true, false), (true, true), (false, false)]
+        {
+            if !main_auth && main_mask {
+                continue;
+            }
+            let masks = |enabled| {
+                if enabled {
+                    vec![("pt", upper(1, "pt"))]
+                } else {
+                    vec![]
+                }
+            };
+            g.set_rules(&[], &masks(main_mask));
+            g.ctx.server.set_auth_response(
+                "default",
+                "fallback_masks$branch_backup",
+                rules(&[], &masks(backup_mask)),
+            );
+            let label = format!(
+                "primary_key={primary_key}, evolution={data_evolution}, \
+                 main_auth={main_auth}, main_mask={main_mask}, backup_mask={backup_mask}"
+            );
+            if !primary_key {
+                let mut read = fallback.new_read_builder();
+                read.with_filter(equals("eng"));
+                let plan = read
+                    .new_scan()
+                    .with_chunk_shuffle(7, 2)
+                    .unwrap()
+                    .plan()
+                    .await;
+                if main_mask || backup_mask {
+                    assert!(
+                        matches!(plan, Err(paimon::Error::Unsupported { ref message })
+                        if message.contains("unmasked partition predicates")),
+                        "{label}: {plan:?}"
+                    );
+                } else {
+                    let batches = read
+                        .new_read()
+                        .unwrap()
+                        .to_arrow(plan.unwrap().splits())
+                        .unwrap()
+                        .try_collect::<Vec<_>>()
+                        .await
+                        .unwrap();
+                    assert_eq!(ids(&batches), vec![2], "{label}");
+                }
+            }
+            let mut direct = backup.new_read_builder();
+            direct
+                .with_projection(&["id"])
+                .unwrap()
+                .with_filter(equals("ENG"));
+            assert_eq!(
+                ids(&read_all(&direct).await.unwrap()),
+                if backup_mask { vec![2] } else { vec![] },
+                "direct backup: {label}"
+            );
+            for (predicate, expected) in [
+                (None, vec![1, 2, 4]),
+                (
+                    Some(equals("ENG")),
+                    if backup_mask { vec![2] } else { vec![] },
+                ),
+                (
+                    Some(equals("eng")),
+                    if backup_mask { vec![] } else { vec![2] },
+                ),
+                // Backup's shared row must stay hidden even when main's mask
+                // makes its owning partition fail the user's predicate.
+                (
+                    Some(equals("SHARED")),
+                    if main_mask { vec![1] } else { vec![] },
+                ),
+                (
+                    Some(equals("shared")),
+                    if main_mask { vec![] } else { vec![1] },
+                ),
+                (
+                    Some(Predicate::and(vec![
+                        equals("SHARED"),
+                        predicates.greater_than("id", Datum::Int(1)).unwrap(),
+                    ])),
+                    vec![],
+                ),
+            ] {
+                let mut builder = fallback.new_read_builder();
+                builder.with_projection(&["id"]).unwrap();
+                if let Some(predicate) = &predicate {
+                    builder.with_filter(predicate.clone());
+                }
+                let reader = builder.new_read().unwrap();
+                let plan = builder.new_scan().plan().await.unwrap();
+                let restored = plan
+                    .splits()
+                    .iter()
+                    .map(|split| {
+                        paimon::DataSplit::deserialize_split_v1(
+                            &split.serialize_split_v1().unwrap(),
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                let restored = reader.authorize_splits(&restored).await.unwrap();
+                for splits in [plan.splits(), restored.as_slice()] {
+                    let batches = reader
+                        .to_arrow(splits)
+                        .unwrap()
+                        .try_collect::<Vec<_>>()
+                        .await
+                        .unwrap();
+                    assert_eq!(ids(&batches), expected, "{label}, predicate={predicate:?}");
+                }
+            }
+            if backup_mask {
+                // Explicit physical selectors must still refuse masked keys.
+                let mut selected = fallback.new_read_builder();
+                selected.with_partition_filter(Some(equals("eng"))).unwrap();
+                let error = selected.new_scan().plan().await.unwrap_err();
+                assert!(
+                    matches!(error, paimon::Error::Unsupported { .. }),
+                    "{error}"
+                );
+            }
+            if !primary_key && !main_mask && backup_mask {
+                // Main owns other partitions, but none is in this scan's
+                // position domain. The first position belongs to backup.
+                let mut sliced = fallback.new_read_builder();
+                sliced
+                    .with_projection(&["id"])
+                    .unwrap()
+                    .with_filter(equals("ENG"))
+                    .with_limit(1);
+                let plan = sliced
+                    .new_scan()
+                    .with_row_position_slice(0, 1)
+                    .unwrap()
+                    .plan()
+                    .await
+                    .unwrap();
+                let batches = sliced
+                    .new_read()
+                    .unwrap()
+                    .to_arrow(plan.splits())
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap();
+                assert_eq!(ids(&batches), vec![2], "position slice: {label}");
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
 async fn test_query_auth_refuses_a_read_wider_than_its_plan() {
     let g = written("narrow", people, vec![people_rows(1..=10)]).await;
     let mut planned = g.table.new_read_builder();
@@ -5824,6 +6162,107 @@ async fn test_rest_catalog_manages_policies_end_to_end() {
         .await
         .unwrap();
     assert!(page.elements.is_empty());
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_fallback_missing_rest_branch_keeps_main_identity_checks() {
+    let g = written("missing_backup", people, vec![people_rows(1..=2)]).await;
+    let view = || {
+        g.table.copy_with_options(HashMap::from([(
+            "scan.fallback-branch".into(),
+            "absent".into(),
+        )]))
+    };
+    let result = read_all(&view().new_read_builder()).await.unwrap();
+    assert_eq!(result.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+
+    g.ctx
+        .server
+        .add_no_permission_table("default", "missing_backup$branch_denied");
+    let denied = g.table.copy_with_options(HashMap::from([(
+        "scan.fallback-branch".into(),
+        "denied".into(),
+    )]));
+    assert_forbidden(read_all(&denied.new_read_builder()).await.unwrap_err());
+
+    g.ctx
+        .server
+        .set_table_uuid("default", "missing_backup", "replacement");
+    assert!(read_all(&view().new_read_builder())
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("uuid"));
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_fallback_restores_compacted_main_splits_from_main_alone() {
+    let g = written(
+        "compacted",
+        |options| {
+            let mut schema = Schema::builder()
+                .column("id", DataType::Int(IntType::new()))
+                .column("name", DataType::VarChar(VarCharType::new(255).unwrap()))
+                .primary_key(["id"])
+                .option("bucket", "1");
+            for (key, value) in options {
+                schema = schema.option(*key, *value);
+            }
+            schema.build().unwrap()
+        },
+        vec![people_rows(1..=2), people_rows(2..=3)],
+    )
+    .await;
+    let mut options = Options::new();
+    options.set(
+        CatalogOptions::WAREHOUSE,
+        g._tmp.path().to_string_lossy().into_owned(),
+    );
+    let plain = FileSystemCatalog::new(options)
+        .unwrap()
+        .get_table(&g.identifier)
+        .await
+        .unwrap();
+    let builder = plain.new_compact_builder();
+    let plan = builder.new_planner().unwrap().plan().await.unwrap();
+    let executor = builder.new_executor().unwrap();
+    let mut results = Vec::new();
+    for task in plan.tasks() {
+        results.push(executor.execute(task).await.unwrap());
+    }
+    builder
+        .new_commit()
+        .unwrap()
+        .commit_compact(results)
+        .await
+        .unwrap();
+    let plan = g.table.new_read_builder().new_scan().plan().await.unwrap();
+    let transported = read_path_completion::transport(&plan);
+    assert!(!transported.is_empty());
+    assert!(transported
+        .iter()
+        .flat_map(|s| s.data_files())
+        .all(|f| f.level > 0));
+
+    // A genuine main split can be restored even if the supplemental table is unavailable.
+    g.ctx
+        .server
+        .add_no_permission_table("default", "compacted$branch_denied");
+    let view = g.table.copy_with_options(HashMap::from([(
+        "scan.fallback-branch".into(),
+        "denied".into(),
+    )]));
+    let reader = view.new_read_builder().new_read().unwrap();
+    let splits = reader.authorize_splits(&transported).await.unwrap();
+    let rows = reader
+        .to_arrow(&splits)
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+    assert_eq!(ids(&rows), vec![1, 2, 3]);
 }
 
 #[tokio::test]

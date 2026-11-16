@@ -188,6 +188,23 @@ print(f"\nRead: {batches_tt[0].num_rows} rows")
 print(batches_tt[0])
 ```
 
+### Batch Reads with a Fallback Branch
+
+Set `scan.fallback-branch` to fill missing partitions from another branch of the
+same table. The current branch takes precedence for each partition it contains.
+Append, primary-key, and Data Evolution tables are supported.
+
+```python
+fallback = table.copy({"scan.fallback-branch": "backup"})
+builder = fallback.new_read_builder()
+plan = builder.new_scan().plan()
+batches = builder.new_read().read(plan.splits())
+```
+
+Use the same table handle for planning and reading. See
+[Fallback Branch Reading](../../docs/src/fallback-branch.md) for partition
+precedence, schema requirements, snapshot selection, and supported operations.
+
 ### Scan statistics
 
 Every scan collects lightweight counters during ordinary metadata planning:

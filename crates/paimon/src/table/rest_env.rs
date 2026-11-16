@@ -287,8 +287,43 @@ impl RESTEnv {
 
     /// Load a table through the same REST catalog environment.
     pub async fn get_table(&self, identifier: &Identifier) -> Result<Table> {
-        Self::load_table(
+        self.get_branch_table(identifier, None).await
+    }
+
+    /// Recognize a missing optional branch only on the GET for that specific branch.
+    pub(super) async fn get_branch_table(
+        &self,
+        identifier: &Identifier,
+        optional_branch: Option<&str>,
+    ) -> Result<Table> {
+        let response = self.api.get_table(identifier).await.map_err(|error| {
+            match (optional_branch, &error) {
+                (
+                    Some(branch),
+                    Error::RestApi {
+                        source:
+                            RestError::NoSuchResource {
+                                resource_type: Some(kind),
+                                resource_name: Some(name),
+                                ..
+                            },
+                    },
+                ) if (kind.eq_ignore_ascii_case("BRANCH") && name == branch)
+                    || (branch != DEFAULT_MAIN_BRANCH
+                        && kind.eq_ignore_ascii_case("TABLE")
+                        && (name == identifier.object() || name == &identifier.full_name())) =>
+                {
+                    Error::BranchNotExist {
+                        full_name: self.identifier.full_name(),
+                        branch_name: branch.to_string(),
+                    }
+                }
+                _ => map_rest_error_for_table(error, identifier),
+            }
+        })?;
+        Self::build_table(
             identifier,
+            response,
             self.api.clone(),
             self.options.clone(),
             self.data_token_enabled,

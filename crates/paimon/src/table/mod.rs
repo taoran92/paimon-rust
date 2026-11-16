@@ -63,6 +63,7 @@ mod dynamic_bucket_assigner;
 mod dynamic_bucket_assigner_router;
 mod dynamic_bucket_index;
 mod external_path;
+mod fallback_read;
 mod format_partition;
 mod format_partition_location;
 mod format_partition_stats;
@@ -343,6 +344,16 @@ pub struct Table {
     travel_snapshot: Option<ReadSnapshot>,
     /// Explicit options remain overrides across later time-travel copies.
     applied_dynamic_option_keys: HashSet<String>,
+    /// The other branch's schema is part of this table's read context, just as
+    /// `schema` is for the current branch. Share its lazy resolution between
+    /// planning and readers, including readers created before planning.
+    fallback_table: Arc<tokio::sync::OnceCell<Option<Table>>>,
+    /// Shared by copies of the same historical read view. A successful lookup
+    /// may capture an empty backup; a failed lookup can be retried.
+    pinned_fallback_snapshot: fallback_read::PinnedFallbackSnapshot,
+    /// Pinning can retain the read schema even with `scan.snapshot-id` set.
+    /// Fallback branches must follow that policy instead of loading snapshot schemas.
+    preserve_read_schema: bool,
 }
 
 impl Table {
@@ -369,6 +380,9 @@ impl Table {
             time_traveled: false,
             travel_snapshot: None,
             applied_dynamic_option_keys: HashSet::new(),
+            fallback_table: Arc::default(),
+            pinned_fallback_snapshot: Arc::default(),
+            preserve_read_schema: false,
         }
     }
 
@@ -412,6 +426,9 @@ impl Table {
             time_traveled: false,
             travel_snapshot: None,
             applied_dynamic_option_keys: HashSet::new(),
+            fallback_table: Arc::default(),
+            pinned_fallback_snapshot: Arc::default(),
+            preserve_read_schema: false,
         })
     }
 
@@ -694,10 +711,12 @@ impl Table {
         HybridSearchBuilder::new(self)
     }
 
+    /// Search the current branch. Partition fallback does not apply to vector searches.
     pub fn new_vector_search_builder(&self) -> VectorSearchBuilder<'_> {
         VectorSearchBuilder::new(self)
     }
 
+    /// Search the current branch for each query, without partition fallback.
     pub fn new_batch_vector_search_builder(&self) -> BatchVectorSearchBuilder<'_> {
         BatchVectorSearchBuilder::new(self)
     }
@@ -753,11 +772,22 @@ impl Table {
                 || k == "scan.mode"
                 || k == "incremental-between-timestamp"
         });
+        let fallback_changed = extra.get("scan.fallback-branch").is_some_and(|branch| {
+            Some(branch) != self.schema.options().get("scan.fallback-branch")
+        });
+        let schema = self.schema.copy_with_options(extra);
         Self {
             file_io: self.file_io.clone(),
             identifier: self.identifier.clone(),
             location: self.location.clone(),
-            schema: self.schema.copy_with_options(extra),
+            pinned_fallback_snapshot: self.fallback_pin_with_options(schema.options()),
+            schema,
+            fallback_table: if fallback_changed {
+                Arc::default()
+            } else {
+                Arc::clone(&self.fallback_table)
+            },
+            preserve_read_schema: self.preserve_read_schema && !selector_changed,
             schema_manager: self.schema_manager.clone(),
             branch: self.branch.clone(),
             branch_reference: self.branch_reference,
@@ -810,6 +840,7 @@ impl Table {
             .iter()
             .any(|key| schema.options().get(*key) != self.schema.options().get(*key));
             return Ok(Self {
+                pinned_fallback_snapshot: self.fallback_pin_with_options(schema.options()),
                 schema,
                 travel_snapshot: if changed {
                     None
@@ -817,6 +848,8 @@ impl Table {
                     self.travel_snapshot.clone()
                 },
                 applied_dynamic_option_keys: HashSet::new(),
+                fallback_table: Arc::default(),
+                preserve_read_schema: self.preserve_read_schema && !changed,
                 ..self.clone()
             });
         }
@@ -836,6 +869,9 @@ impl Table {
             // Not the schema the catalog loaded, so not a handle it authorizes.
             query_auth_session: None,
             applied_dynamic_option_keys: HashSet::new(),
+            fallback_table: Arc::default(),
+            pinned_fallback_snapshot: Arc::default(),
+            preserve_read_schema: false,
             ..self.clone()
         })
     }
@@ -848,11 +884,13 @@ impl Table {
     /// current table schema.
     pub async fn copy_with_resolved_snapshot(&self, snapshot: &Snapshot) -> Result<Self> {
         let mut table = self.copy_with_pinned_snapshot(Some(snapshot));
+        table.preserve_read_schema = false;
         if snapshot.schema_id() != self.schema.id() {
             let schema = self.schema_manager.schema(snapshot.schema_id()).await?;
             let options = table.historical_field_options(&schema);
             table.schema = schema.copy_with_replaced_options(options);
         }
+        table.pin_resolved_fallback().await?;
         Ok(table)
     }
 
@@ -894,25 +932,32 @@ impl Table {
             );
         }
 
+        let previous =
+            self.travel_snapshot
+                .as_ref()
+                .filter(|view| match (view.snapshot(), snapshot) {
+                    (Some(known), Some(snapshot)) => known.has_same_read_metadata(snapshot),
+                    (None, None) => true,
+                    _ => false,
+                });
         Self {
+            pinned_fallback_snapshot: if previous.is_some() {
+                // Rewriting the selector to the same snapshot ID preserves the branch pair.
+                self.pinned_fallback_snapshot.clone()
+            } else {
+                Arc::default()
+            },
             schema: self.schema.copy_with_replaced_options(options),
             time_traveled: true,
-            travel_snapshot: Some(match snapshot {
-                Some(snapshot) => match &self.travel_snapshot {
-                    Some(view)
-                        if view
-                            .snapshot()
-                            .is_some_and(|known| known.has_same_read_metadata(snapshot)) =>
-                    {
-                        view.clone()
-                    }
-                    _ => ReadSnapshot::Snapshot(
-                        Arc::new(snapshot.clone()),
-                        Arc::new(tokio::sync::OnceCell::new()),
-                    ),
-                },
+            // Re-pinning an already resolved view retains its schema policy,
+            // including historical schemas selected by explicit time travel.
+            preserve_read_schema: self.preserve_read_schema || self.travel_snapshot.is_none(),
+            travel_snapshot: Some(previous.cloned().unwrap_or_else(|| match snapshot {
+                Some(snapshot) => {
+                    ReadSnapshot::Snapshot(Arc::new(snapshot.clone()), Arc::default())
+                }
                 None => ReadSnapshot::Empty,
-            }),
+            })),
             ..self.clone()
         }
     }
@@ -1049,6 +1094,7 @@ impl Table {
             resolved.ok().flatten()
         };
         if let Some(snapshot) = snapshot {
+            table.preserve_read_schema = false;
             if snapshot.schema_id() != table.schema.id() {
                 let snapshot_schema = table.schema_manager.schema(snapshot.schema_id()).await?;
                 let options = table.historical_field_options(&snapshot_schema);
@@ -1057,10 +1103,17 @@ impl Table {
             }
             // Resolved by this table's snapshot/tag manager rather than supplied
             // by a caller; its origin is already known.
+            if self
+                .travel_snapshot()
+                .is_none_or(|old| !old.has_same_read_metadata(&snapshot))
+            {
+                table.pinned_fallback_snapshot = Arc::default();
+            }
             table.travel_snapshot = Some(ReadSnapshot::Snapshot(
                 Arc::new(snapshot),
                 Arc::new(tokio::sync::OnceCell::new_with(Some(()))),
             ));
+            table.pin_resolved_fallback().await?;
         }
         Ok(table)
     }
@@ -1097,6 +1150,10 @@ impl Table {
     }
 
     pub async fn copy_with_branch(&self, branch_name: &str) -> Result<Self> {
+        self.load_branch(branch_name, false).await
+    }
+
+    async fn load_branch(&self, branch_name: &str, optional: bool) -> Result<Self> {
         // The branch schema replaces this one wholesale and could drop the
         // declared type, so refuse before any branch I/O.
         CoreOptions::new(self.schema.options())
@@ -1115,12 +1172,15 @@ impl Table {
             // Load their schema and identity through the same catalog. A table
             // copy retains the original FileIO, including its bound FUSE mount.
             let identifier = env.identifier().with_branch(&branch)?;
-            let (current, mut table) = tokio::try_join!(
+            let (current, target) = tokio::join!(
                 env.current_table_identity_checked(),
-                env.get_table(&identifier)
-            )?;
-            if current.path.as_deref() != Some(self.location())
-                || table.location() != self.location()
+                env.get_branch_table(&identifier, optional.then_some(branch.as_str()))
+            );
+            // A missing target is a no-op only while the source identity and location hold.
+            if current?.path.as_deref() != Some(self.location())
+                || target
+                    .as_ref()
+                    .is_ok_and(|table| table.location() != self.location())
             {
                 return Err(crate::Error::DataInvalid {
                     message: format!(
@@ -1130,6 +1190,7 @@ impl Table {
                     source: None,
                 });
             }
+            let mut table = target?;
             table.file_io = self.file_io.clone();
             let schema_manager = SchemaManager::new(table.file_io.clone(), table.location.clone());
             table.schema_manager = if branch == DEFAULT_MAIN_BRANCH {
@@ -1169,6 +1230,9 @@ impl Table {
             time_traveled: false,
             travel_snapshot: None,
             applied_dynamic_option_keys: HashSet::new(),
+            fallback_table: Arc::default(),
+            pinned_fallback_snapshot: Arc::default(),
+            preserve_read_schema: false,
         })
     }
 

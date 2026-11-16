@@ -63,6 +63,8 @@ use std::sync::Arc;
 mod audit;
 pub use audit::AuditLogScan;
 
+#[path = "table_scan/fallback.rs"]
+mod fallback;
 #[path = "table_scan/restore_splits.rs"]
 mod restore_splits;
 
@@ -1127,6 +1129,7 @@ impl<'a> TableScan<'a> {
             bucket_predicate: scan.bucket_predicate,
             limit: scan.limit,
             row_ranges: scan.row_ranges,
+            row_ranges_from_filter: scan.row_ranges_from_filter,
             split_selection: scan.split_selection,
             row_range_optimization_disabled: scan.row_range_optimization_disabled,
             scan_all_files: scan.scan_all_files,
@@ -1277,6 +1280,7 @@ impl<'a> TableScan<'a> {
         }
     }
 
+    /// Select branch-local row IDs; fallback branches are not scanned.
     pub fn with_row_ranges(self, ranges: Vec<RowRange>) -> Self {
         match self.0 {
             TableScanKind::Paimon(scan) => {
@@ -1292,6 +1296,7 @@ impl<'a> TableScan<'a> {
     /// bypass snapshot resolution and further pruning, preserving their source
     /// metadata exactly. Query-authorized scans ignore supplied selections,
     /// since indexes describe raw values that masks may change.
+    /// Row-ID results select only the current branch, even with fallback enabled.
     pub fn with_global_index_result(mut self, result: GlobalIndexResult) -> crate::Result<Self> {
         match &mut self.0 {
             TableScanKind::Paimon(scan) => {
@@ -1363,7 +1368,9 @@ impl<'a> TableScan<'a> {
                     });
                 }
                 scan.split_selection = Some(Box::new(ScanSplitSelection {
+                    logical_partition_predicate: scan.logical_partition_predicate().cloned(),
                     mode: Some(ScanSplitMode::ChunkShuffle(config)),
+                    row_id_ordered: false,
                     shard: scan.shard(),
                     bucket_filter: scan.bucket_filter().cloned(),
                     only_real_buckets: scan.only_real_buckets(),
@@ -1407,7 +1414,9 @@ impl<'a> TableScan<'a> {
                     Some(selection) => selection.shard = Some((index, count)),
                     None => {
                         scan.split_selection = Some(Box::new(ScanSplitSelection {
+                            logical_partition_predicate: None,
                             mode: None,
+                            row_id_ordered: false,
                             shard: Some((index, count)),
                             bucket_filter: None,
                             only_real_buckets: false,
@@ -1481,7 +1490,9 @@ impl<'a> TableScan<'a> {
                     });
                 }
                 scan.split_selection = Some(Box::new(ScanSplitSelection {
+                    logical_partition_predicate: scan.logical_partition_predicate().cloned(),
                     mode: Some(ScanSplitMode::RowPosition(selection)),
+                    row_id_ordered: true,
                     shard: None,
                     bucket_filter: scan.bucket_filter().cloned(),
                     only_real_buckets: scan.only_real_buckets(),
@@ -1495,6 +1506,22 @@ impl<'a> TableScan<'a> {
                 message: "row-position selection only supports append tables".into(),
             }),
         }
+    }
+
+    pub(super) fn with_logical_filters(
+        mut self,
+        partition: Option<Predicate>,
+        row_ranges_from_filter: bool,
+    ) -> Self {
+        if let TableScanKind::Paimon(scan) = &mut self.0 {
+            scan.row_ranges_from_filter = row_ranges_from_filter;
+            if partition.is_some() {
+                scan.split_selection
+                    .get_or_insert_with(Default::default)
+                    .logical_partition_predicate = partition;
+            }
+        }
+        self
     }
 
     pub(super) fn with_projected_read_field_ids(
@@ -1683,7 +1710,12 @@ enum ScanSplitMode {
 
 #[derive(Debug, Clone, Default)]
 struct ScanSplitSelection {
+    /// A logical predicate normalized to partition indices, not an explicit
+    /// physical selector. Another branch may need to evaluate it after masking.
+    logical_partition_predicate: Option<Predicate>,
     mode: Option<ScanSplitMode>,
+    /// Preserve group order after positional selection is translated to row IDs.
+    row_id_ordered: bool,
     shard: Option<(usize, usize)>,
     bucket_filter: Option<BucketFilter>,
     only_real_buckets: bool,
@@ -1720,11 +1752,12 @@ struct PaimonTableScan<'a> {
     /// Optional limit on the number of rows to return.
     /// When set, the scan will try to return only enough splits to satisfy the limit.
     limit: Option<usize>,
-    /// Statistics collection is requested explicitly.
     row_ranges: Option<Vec<RowRange>>,
-    /// Mutually exclusive row-position or fixed-row chunk transformation.
-    /// Boxed because scans normally use neither, and keeping the cold payload
-    /// out of the scan preserves the compact `TableScanKind` representation.
+    /// Only ranges derived entirely from a logical filter apply to both branches.
+    row_ranges_from_filter: bool,
+    /// Split selection and logical partition provenance for branch planning.
+    /// Keeping this optional payload boxed preserves the compact `TableScanKind`
+    /// representation for scans that need none of these options.
     split_selection: Option<Box<ScanSplitSelection>>,
     /// Diff compares complete logical states, so it must not accept physical
     /// row-range pruning from an explicit range or a global-index lookup.
@@ -1742,6 +1775,12 @@ struct PaimonTableScan<'a> {
 }
 
 impl<'a> PaimonTableScan<'a> {
+    fn logical_partition_predicate(&self) -> Option<&Predicate> {
+        self.split_selection
+            .as_ref()
+            .and_then(|s| s.logical_partition_predicate.as_ref())
+    }
+
     fn global_index_result(&self) -> Option<&GlobalIndexResult> {
         self.split_selection
             .as_deref()
@@ -1862,6 +1901,7 @@ impl<'a> PaimonTableScan<'a> {
             bucket_predicate,
             limit,
             row_ranges,
+            row_ranges_from_filter: false,
             split_selection: None,
             row_range_optimization_disabled: false,
             scan_all_files: false,
@@ -1893,6 +1933,7 @@ impl<'a> PaimonTableScan<'a> {
     /// results from global index lookups. An empty vector selects no rows.
     pub fn with_row_ranges(mut self, ranges: Vec<RowRange>) -> Self {
         self.row_ranges = Some(ranges);
+        self.row_ranges_from_filter = false;
         self
     }
 
@@ -1960,6 +2001,16 @@ impl<'a> PaimonTableScan<'a> {
             .incremental_timestamp_window()?
         {
             return scan.plan_timestamp_window(start, end, stats).await;
+        }
+        // Explicit row IDs and index results belong to the current branch.
+        // Applying them to backup would select unrelated rows with the same IDs.
+        if !scan.scan_all_files
+            && (self.row_ranges.is_none() || self.row_ranges_from_filter)
+            && self.global_index_result().is_none()
+        {
+            if let Some(plan) = scan.plan_fallback(self, stats).await? {
+                return Ok(plan);
+            }
         }
         let data_evolution_read_field_ids = scan.projected_read_field_ids()?;
         let plan = match super::time_travel::resolve_snapshot(&scan.table).await? {
@@ -3198,7 +3249,11 @@ impl<'a> PaimonTableScan<'a> {
                     row_id_groups
                 };
 
-                if self.row_position_selection().is_some() {
+                if self
+                    .split_selection
+                    .as_ref()
+                    .is_some_and(|s| s.row_id_ordered)
+                {
                     // Positional scans promise row-id order across groups. A
                     // projected group can become a singleton, so moving all
                     // multi-file groups first would change which rows a limit
@@ -3361,12 +3416,12 @@ impl<'a> PaimonTableScan<'a> {
                 (splits, split_candidates_built, false)
             };
         let splits = if let Some(selection) = append_row_position_selection {
-            selection.select_append_splits(splits, core_options.row_tracking_enabled())?
+            selection.select_append_splits(splits, |_| core_options.row_tracking_enabled())?
         } else {
             splits
         };
         let splits = if let Some(config) = self.chunk_shuffle() {
-            chunk_shuffle_splits(&self.table, splits, config, self.shard()).await?
+            chunk_shuffle_splits(&self.table, None, splits, config, self.shard()).await?
         } else {
             splits
         };

@@ -29,8 +29,12 @@ mod common;
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::Int64Array;
+use datafusion::arrow::array::{ArrayRef, Int32Array, Int64Array};
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_plan::{displayable, ExecutionPlan};
+use paimon::catalog::Identifier;
+use paimon::spec::{DataType, IntType, SchemaChange};
+use paimon::Catalog;
 use paimon_datafusion::SQLContext;
 
 /// Creates a test sql_context with a table ready for inserts.
@@ -127,6 +131,91 @@ async fn test_count_star_no_filter_pushes_down() {
 
     let count = run_count_query(&sql_context, "SELECT COUNT(*) FROM paimon.test_db.t").await;
     assert_eq!(count, 3, "COUNT(*) should return 3");
+}
+
+#[tokio::test]
+async fn test_fallback_count_column_after_drop_and_add() {
+    let (_tmp, catalog) = common::create_test_env();
+    let sql_context = common::create_sql_context(catalog.clone()).await;
+    for sql in [
+        "CREATE SCHEMA paimon.test_db",
+        "CREATE TABLE paimon.test_db.t (id INT, pt INT, age INT) PARTITIONED BY (pt)",
+        "INSERT INTO paimon.test_db.t VALUES (1, 10, 111)",
+        "CALL sys.create_branch(table => 'test_db.t', branch => 'backup')",
+    ] {
+        common::exec(&sql_context, sql).await;
+    }
+    let main = catalog
+        .get_table(&Identifier::new("test_db", "t"))
+        .await
+        .unwrap();
+    let backup = main.copy_with_branch("backup").await.unwrap();
+    let builder = backup.new_write_builder();
+    let mut writer = builder.new_write().unwrap();
+    let batch = RecordBatch::try_from_iter([
+        ("id", Arc::new(Int32Array::from(vec![2])) as ArrayRef),
+        ("pt", Arc::new(Int32Array::from(vec![20]))),
+        ("age", Arc::new(Int32Array::from(vec![222]))),
+    ])
+    .unwrap();
+    writer.write_arrow_batch(&batch).await.unwrap();
+    builder
+        .new_commit()
+        .commit(writer.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+
+    // Evolve only backup's schema, leaving its files at schema 0, which has
+    // the same numeric ID as main's current schema but a different read view.
+    let mut schema = backup.schema().clone();
+    for change in [
+        SchemaChange::drop_column("age".into()),
+        SchemaChange::add_column("age".into(), DataType::Int(IntType::new())),
+    ] {
+        schema = schema.apply_changes(vec![change]).unwrap();
+        backup
+            .file_io()
+            .new_output(&backup.schema_manager().schema_path(schema.id()))
+            .unwrap()
+            .write(serde_json::to_vec(&schema).unwrap().into())
+            .await
+            .unwrap();
+    }
+    assert_eq!(main.schema().id(), 0);
+    assert_eq!(schema.id(), 2);
+    assert_ne!(main.schema().fields()[2].id(), schema.fields()[2].id());
+
+    common::exec(&sql_context, "SET 'paimon.scan.fallback-branch' = 'backup'").await;
+    let batches = sql_context
+        .sql("SELECT age FROM paimon.test_db.t ORDER BY id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let ages: Vec<_> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .iter()
+        })
+        .collect();
+    assert_eq!(ages, vec![Some(111), None]);
+    let sql = "SELECT COUNT(age) FROM paimon.test_db.t";
+    assert_eq!(run_count_query(&sql_context, sql).await, 1);
+    assert!(
+        verify_count_pushdown(&sql_context, sql).await.is_err(),
+        "fallback column counts must not use main's manifest column statistics"
+    );
+    let sql = "SELECT COUNT(*) FROM paimon.test_db.t";
+    assert_eq!(run_count_query(&sql_context, sql).await, 2);
+    verify_count_pushdown(&sql_context, sql)
+        .await
+        .expect("fallback split row counts remain exact");
 }
 
 // ============================================================================

@@ -66,6 +66,7 @@ struct InputFile {
 
 #[derive(Debug)]
 struct InputGroup {
+    read_context: DataSplit,
     partition: BinaryRow,
     bucket: i32,
     bucket_path: String,
@@ -92,6 +93,7 @@ struct EvolutionSegment {
 /// resolution remain centralized in `TableScan`.
 pub(crate) async fn chunk_shuffle_splits(
     table: &Table,
+    fallback_table: Option<&Table>,
     splits: Vec<DataSplit>,
     config: &ChunkShuffle,
     shard: Option<(usize, usize)>,
@@ -119,10 +121,19 @@ pub(crate) async fn chunk_shuffle_splits(
             .then_with(|| left.bucket.cmp(&right.bucket))
     });
 
-    let data_evolution = table.schema().core_options().data_evolution_enabled();
     let mut chunks = Vec::new();
     for mut group in groups {
-        if data_evolution {
+        // Keep the global partition order and shuffle, but build each group's
+        // ranges with the table that will read them, including its FileIO.
+        let group_table = if group.read_context.is_fallback() {
+            fallback_table.ok_or_else(|| crate::Error::UnexpectedError {
+                message: "Fallback chunks require the fallback branch's read table".into(),
+                source: None,
+            })?
+        } else {
+            table
+        };
+        if group_table.schema().core_options().data_evolution_enabled() {
             group.files.sort_by(|left, right| {
                 left.file
                     .first_row_id
@@ -133,12 +144,12 @@ pub(crate) async fn chunk_shuffle_splits(
                     })
                     .then_with(|| left.file.file_name.cmp(&right.file.file_name))
             });
-            chunks.extend(evolution_chunks(table, group, config.chunk_size).await?);
+            chunks.extend(evolution_chunks(group_table, group, config.chunk_size).await?);
         } else {
             group
                 .files
                 .sort_by(|left, right| left.file.file_name.cmp(&right.file.file_name));
-            chunks.extend(append_chunks(table, group, config.chunk_size).await?);
+            chunks.extend(append_chunks(group_table, group, config.chunk_size).await?);
         }
     }
 
@@ -206,6 +217,7 @@ fn flatten_groups(splits: Vec<DataSplit>) -> crate::Result<Vec<InputGroup>> {
         let deletion_files = split.data_deletion_files();
         let key = (split.partition().to_serialized_bytes(), split.bucket());
         let group = grouped.entry(key).or_insert_with(|| InputGroup {
+            read_context: split.clone(),
             partition: split.partition().clone(),
             bucket: split.bucket(),
             bucket_path: split.bucket_path().to_string(),
@@ -318,7 +330,7 @@ fn build_append_split(
     if deletion_files.iter().any(Option::is_some) {
         builder = builder.with_data_deletion_files(deletion_files);
     }
-    builder.build()
+    Ok(builder.build()?.with_read_context(&group.read_context))
 }
 
 async fn evolution_chunks(
@@ -460,7 +472,7 @@ fn build_evolution_split(
     if deletion_files.iter().any(Option::is_some) {
         builder = builder.with_data_deletion_files(deletion_files);
     }
-    builder.build()
+    Ok(builder.build()?.with_read_context(&group.read_context))
 }
 
 fn base_builder(group: &InputGroup, files: Vec<DataFileMeta>, raw: bool) -> DataSplitBuilder {
@@ -896,7 +908,7 @@ mod tests {
             true,
         );
         let config = ChunkShuffle::from_decimal_seed("42", 3).unwrap();
-        let chunks = chunk_shuffle_splits(&table, vec![input.clone()], &config, None)
+        let chunks = chunk_shuffle_splits(&table, None, vec![input.clone()], &config, None)
             .await
             .unwrap();
         assert_eq!(chunks.len(), 3);
@@ -940,10 +952,10 @@ mod tests {
             ]
         );
 
-        let left = chunk_shuffle_splits(&table, vec![input.clone()], &config, Some((0, 2)))
+        let left = chunk_shuffle_splits(&table, None, vec![input.clone()], &config, Some((0, 2)))
             .await
             .unwrap();
-        let right = chunk_shuffle_splits(&table, vec![input], &config, Some((1, 2)))
+        let right = chunk_shuffle_splits(&table, None, vec![input], &config, Some((1, 2)))
             .await
             .unwrap();
         assert_eq!([left, right].concat(), chunks);
@@ -961,6 +973,7 @@ mod tests {
         );
         let chunks = chunk_shuffle_splits(
             &table,
+            None,
             vec![input],
             &ChunkShuffle::from_decimal_seed("0", 3).unwrap(),
             None,
@@ -981,6 +994,7 @@ mod tests {
         let missing_row_id = split(vec![file("legacy.parquet", 2, None)], true);
         let error = chunk_shuffle_splits(
             &table,
+            None,
             vec![missing_row_id],
             &ChunkShuffle::from_decimal_seed("0", 3).unwrap(),
             None,
@@ -1003,6 +1017,7 @@ mod tests {
         );
         let chunks = chunk_shuffle_splits(
             &table,
+            None,
             vec![input],
             &ChunkShuffle::from_decimal_seed("0", 3).unwrap(),
             None,

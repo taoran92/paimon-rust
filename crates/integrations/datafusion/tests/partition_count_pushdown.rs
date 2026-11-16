@@ -80,6 +80,90 @@ fn row(key: &str, count: i64) -> (String, i64) {
     (key.to_string(), count)
 }
 
+#[tokio::test]
+async fn test_fallback_count_respects_partition_ownership() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut options = Options::new();
+    options.set(CatalogOptions::WAREHOUSE, temp_dir.path().to_str().unwrap());
+    let catalog = Arc::new(FileSystemCatalog::new(options).unwrap());
+    let mut ctx = SQLContext::new();
+    ctx.register_catalog("paimon", catalog.clone())
+        .await
+        .unwrap();
+    exec(&ctx, "CREATE SCHEMA paimon.test_db").await;
+    exec(
+        &ctx,
+        "CREATE TABLE paimon.test_db.fallback_count (id INT NOT NULL, pt INT) PARTITIONED BY (pt)",
+    )
+    .await;
+    exec(
+        &ctx,
+        "INSERT INTO paimon.test_db.fallback_count VALUES (2, 20), (3, 10)",
+    )
+    .await;
+    let table = catalog
+        .get_table(&Identifier::new("test_db", "fallback_count"))
+        .await
+        .unwrap();
+    let snapshot = table
+        .snapshot_manager()
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    table.tag_manager().create("base", &snapshot).await.unwrap();
+    paimon::table::BranchManager::new(table.file_io().clone(), table.location().into())
+        .create_branch_from_tag("backup", "base")
+        .await
+        .unwrap();
+    exec(&ctx, "TRUNCATE TABLE paimon.test_db.fallback_count").await;
+    exec(
+        &ctx,
+        "INSERT INTO paimon.test_db.fallback_count VALUES (1, 10)",
+    )
+    .await;
+    assert_eq!(
+        rows(&ctx, "SELECT COUNT(id) FROM paimon.test_db.fallback_count").await,
+        vec![row("", 1)]
+    );
+
+    for (branch, expected) in [("backup", 2), ("", 1), ("main", 1), ("missing", 1)] {
+        catalog
+            .alter_table(
+                &Identifier::new("test_db", "fallback_count"),
+                vec![paimon::spec::SchemaChange::set_option(
+                    "scan.fallback-branch".into(),
+                    branch.into(),
+                )],
+                false,
+            )
+            .await
+            .unwrap();
+        let sql = "SELECT COUNT(*) FROM paimon.test_db.fallback_count";
+        assert_eq!(
+            rows(&ctx, &sql.replace("COUNT(*)", "COUNT(id)")).await,
+            vec![row("", expected)]
+        );
+        assert_eq!(
+            rows(&ctx, sql).await,
+            vec![row("", expected)],
+            "fallback={branch}"
+        );
+        for sql in [
+            "SELECT pt, COUNT(*) FROM paimon.test_db.fallback_count GROUP BY pt",
+            "SELECT COUNT(*) FROM paimon.test_db.fallback_count WHERE pt = 20",
+            "SELECT pt, COUNT(*) FROM paimon.test_db.fallback_count WHERE pt = 10 GROUP BY pt",
+            "SELECT COUNT(*) FROM paimon.test_db.fallback_count WHERE id = 3",
+        ] {
+            assert_eq!(
+                rows(&ctx, sql).await,
+                rows(&ctx, &sql.replace("COUNT(*)", "COUNT(id)")).await,
+                "fallback={branch}: {sql}"
+            );
+        }
+    }
+}
+
 /// A data-evolution table partitioned by `(dt, content_key)` whose `name` column
 /// was rewritten by MERGE INTO, so several files cover the same rows.
 async fn setup() -> (TempDir, Arc<FileSystemCatalog>, SQLContext) {

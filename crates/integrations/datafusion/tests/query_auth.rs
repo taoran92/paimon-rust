@@ -361,6 +361,116 @@ async fn test_query_auth_filters_masked_partition_values() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_fallback_query_auth_keeps_sql_expressions_above_authorization() {
+    let partitioned_schema = |options: &[(&str, &str)]| {
+        let mut builder = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("name", DataType::VarChar(VarCharType::new(255).unwrap()))
+            .column("secret", DataType::VarChar(VarCharType::new(255).unwrap()))
+            .partition_keys(["name"]);
+        for (key, value) in options {
+            builder = builder.option(*key, *value);
+        }
+        builder.build().unwrap()
+    };
+    let (tmp, server, context) = restricted_people_with_schema(None, partitioned_schema).await;
+    let mut options = Options::new();
+    options.set(
+        CatalogOptions::WAREHOUSE,
+        format!("file://{}", tmp.path().display()),
+    );
+    let catalog = FileSystemCatalog::new(options).unwrap();
+    let table = catalog
+        .get_table(&Identifier::new("default", "people"))
+        .await
+        .unwrap();
+    paimon::table::BranchManager::new(table.file_io().clone(), table.location().into())
+        .create_branch("backup")
+        .await
+        .unwrap();
+    let backup = table.copy_with_branch("backup").await.unwrap();
+    let batch = RecordBatch::try_from_iter([
+        (
+            "id",
+            Arc::new(Int32Array::from(vec![12, 14])) as arrow_array::ArrayRef,
+        ),
+        ("name", Arc::new(StringArray::from(vec!["eng", "eng"]))),
+        (
+            "secret",
+            Arc::new(StringArray::from(vec!["hidden", "hidden"])),
+        ),
+    ])
+    .unwrap();
+    let builder = backup.new_write_builder();
+    let mut write = builder.new_write().unwrap();
+    write.write_arrow_batch(&batch).await.unwrap();
+    builder
+        .new_commit()
+        .commit(write.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+    server.add_table_with_schema(
+        "default",
+        "people",
+        partitioned_schema(&[("scan.fallback-branch", "backup")]),
+        table.location(),
+    );
+    server.add_table_with_schema(
+        "default",
+        "people$branch_backup",
+        partitioned_schema(&[("query-auth.enabled", "true")]),
+        table.location(),
+    );
+
+    // An unrestricted grant still requires authorization and forbids decoder filters.
+    for restricted in [false, true] {
+        server.set_auth_response(
+            "default",
+            "people$branch_backup",
+            if restricted {
+                AuthTableQueryResponse {
+                    filter: Some(vec![json!({
+                        "kind": "LEAF",
+                        "transform": {
+                            "name": "FIELD_REF",
+                            "fieldRef": {"index": 0, "name": "id", "type": "INT"},
+                        },
+                        "function": "LESS_THAN",
+                        "literals": [14],
+                    })
+                    .to_string()]),
+                    column_masking: masks(),
+                }
+            } else {
+                AuthTableQueryResponse::default()
+            },
+        );
+        let name = if restricted { "ENG" } else { "eng" };
+        for predicate in [
+            "id > 10 AND id % 2 = 0",
+            "id > 10 AND length(name) = 3",
+            "abs(id) = 12",
+        ] {
+            let mut expected = vec![(12, name.to_string())];
+            if !restricted && !predicate.starts_with("abs") {
+                expected.push((14, name.to_string()));
+            }
+            assert_eq!(
+                id_names(
+                    &query(
+                        &context,
+                        &format!("SELECT id, name FROM {TABLE} WHERE {predicate}")
+                    )
+                    .await
+                ),
+                expected,
+                "restricted={restricted}, predicate={predicate}",
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_max_pt_refuses_filtered_or_masked_partition_metadata() {
     let (_tmp, server, context) = restricted_people_with_schema(None, |options| {
         let mut builder = Schema::builder()

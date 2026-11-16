@@ -646,6 +646,23 @@ def test_split_wire_roundtrip_reads_same_rows():
         assert roundtrip.equals(original)
 
 
+def test_fallback_query_auth_split_wire_roundtrip_preserves_java_routing():
+    from pathlib import Path
+
+    goldens = (Path(__file__).resolve().parents[3]
+               / "crates/paimon/src/table/goldens")
+    authorized = (goldens / "split_v1_query_auth.bin").read_bytes()
+    # Java dispatches using the outer FallbackSplit (type 7), then applies
+    # the nested QueryAuthSplit (type 5), including its captured policy.
+    frame = b"SPLIT_V1" + (1).to_bytes(4, "big") + (7).to_bytes(4, "big")
+    frame += b"\x01" + authorized
+
+    restored = Split.deserialize(frame)
+
+    assert restored.serialize() == frame
+    assert pickle.loads(pickle.dumps(restored)).serialize() == frame
+
+
 def test_indexed_split_wire_roundtrip_preserves_row_ranges():
     with tempfile.TemporaryDirectory() as warehouse:
         ctx = SQLContext()
@@ -1445,6 +1462,129 @@ def test_unsupported_scan_option_raises_not_implemented():
         table = PaimonCatalog({"warehouse": warehouse}).get_table("tdb.t")
         with pytest.raises(NotImplementedError):
             table.new_read_builder({"incremental-between": "1,2"})
+
+
+@pytest.mark.parametrize("source,schema_change", [
+    ("table", None), ("copy", None), ("read", None),
+    ("copy", "add"), ("copy", "readd"),
+])
+def test_fallback_branch_scan_merges_partitions(source, schema_change):
+    from pathlib import Path
+    import shutil
+    import pickle
+
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.rdb")
+        ctx.sql("CREATE TABLE paimon.rdb.t (id INT, pt STRING) PARTITIONED BY (pt)")
+        ctx.sql("INSERT INTO paimon.rdb.t VALUES (2, 'backup'), (3, 'shared')")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("rdb.t")
+        root = Path(table.location())
+        backup = root / "branch" / "branch-backup"
+        shutil.copytree(root / "schema", backup / "schema")
+        shutil.copytree(root / "snapshot", backup / "snapshot")
+        writer = table.copy({"dynamic-partition-overwrite": "false"}).new_batch_write_builder().with_overwrite()
+        write = writer.new_write()
+        write.write_arrow(pa.record_batch([pa.array([1], type=pa.int32()), pa.array(["shared"])], names=["id", "pt"]))
+        writer.new_commit().commit(write.prepare_commit())
+        assert _read_ids(table.new_read_builder()) == [1]
+        options = {"scan.fallback-branch": "backup"}
+        if source == "table":
+            schema_path = root / "schema" / "schema-0"
+            schema = json.loads(schema_path.read_text())
+            schema["options"].update(options)
+            schema_path.write_text(json.dumps(schema))
+            table = PaimonCatalog({"warehouse": warehouse}).get_table("rdb.t")
+        elif source == "copy":
+            table = table.copy(options)
+        builder = table.new_read_builder(options if source == "read" else None)
+        reader = builder.new_read()
+        assert _read_ids(builder) == [1, 2]
+        splits = builder.new_scan().with_file_filters(False, False).plan().splits()
+        transported = [Split.deserialize(split.serialize()) for split in splits]
+        pickled = pickle.loads(pickle.dumps(splits))
+        if schema_change is not None:
+            schema = json.loads((backup / "schema" / "schema-0").read_text())
+            schema["id"] = 1
+            schema["highestFieldId"] = 2
+            if schema_change == "readd":
+                schema["fields"][0]["id"] = 2
+            else:
+                schema["fields"].append({"id": 2, "name": "extra", "type": "INT"})
+            (backup / "schema" / "schema-1").write_text(json.dumps(schema))
+        for restored in (splits, transported, pickled):
+            for captured in (reader, builder.new_read()):
+                rows = pa.Table.from_batches(captured.read(restored))
+                assert sorted(rows.column("id").to_pylist()) == [1, 2]
+        # A reader can narrow a transported plan after planning. Keep main
+        # only, fallback only, or no splits without losing branch context.
+        for partition, expected in [("shared", [1]), ("backup", [2]), ("missing", [])]:
+            builder.with_filter({"method": "equal", "field": "pt", "literals": [partition]})
+            batches = builder.new_read().read(splits)
+            assert sorted(row["id"] for batch in batches for row in batch.to_pylist()) == expected
+        builder.with_filter({"method": "equal", "field": "id", "literals": [3]})
+        assert _read_ids(builder) == []
+
+
+@pytest.mark.parametrize("fallback", ["", " \t ", "main"])
+def test_fallback_branch_scan_preserves_noop_options(fallback):
+    with tempfile.TemporaryDirectory() as warehouse:
+        table = _make_table_with_data(warehouse)
+        builder = table.new_read_builder({"scan.fallback-branch": fallback})
+        assert _read_ids(builder) == [1, 2, 3]
+
+
+@pytest.mark.parametrize("main_tracking", [False, True])
+@pytest.mark.parametrize("selection", ["slice", "position_shard", "chunk_shuffle", "chunk_shards"])
+def test_fallback_row_tracking_positions(main_tracking, selection):
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as warehouse:
+        ctx = SQLContext()
+        ctx.register_catalog("paimon", {"warehouse": warehouse})
+        ctx.sql("CREATE SCHEMA paimon.rdb")
+        ctx.sql(
+            "CREATE TABLE paimon.rdb.t (id INT, pt INT) PARTITIONED BY (pt) "
+            "WITH ('row-tracking.enabled' = '%s')" % str(main_tracking).lower()
+        )
+        ctx.sql("CALL sys.create_branch(table => 'rdb.t', branch => 'backup')")
+        table = PaimonCatalog({"warehouse": warehouse}).get_table("rdb.t")
+        # Choose the other branch's layout while it is still empty.
+        schema_path = Path(table.location()) / "branch" / "branch-backup" / "schema" / "schema-0"
+        schema = json.loads(schema_path.read_text())
+        schema["options"]["row-tracking.enabled"] = str(not main_tracking).lower()
+        schema_path.write_text(json.dumps(schema))
+        backup = table.copy({"branch": "backup"})
+
+        def append(target, ids, partitions):
+            writer = target.new_batch_write_builder()
+            write = writer.new_write()
+            write.write_arrow(pa.record_batch(
+                [pa.array(ids, type=pa.int32()), pa.array(partitions, type=pa.int32())],
+                names=["id", "pt"],
+            ))
+            writer.new_commit().commit(write.prepare_commit())
+
+        append(table, [1, 2], [10, 10])
+        append(backup, [3], [20])
+        append(backup, [4, 5], [30, 30])
+        builder = table.copy({"scan.fallback-branch": "backup"}).new_read_builder()
+        assert _read_ids(builder) == [1, 2, 3, 4, 5]
+        if selection == "slice":
+            plans = [builder.new_scan().with_row_position_slice(4, 5).plan()]
+        elif selection == "position_shard":
+            plans = [builder.new_scan().with_row_position_shard(2, 3).plan()]
+        elif selection == "chunk_shuffle":
+            plans = [builder.new_scan().with_chunk_shuffle("42", 1).plan()]
+        else:
+            plans = [
+                builder.new_scan().with_chunk_shuffle("42", 1).with_shard(index, 3).plan()
+                for index in range(3)
+            ]
+        restored = [Split.deserialize(split.serialize()) for plan in plans for split in plan.splits()]
+        actual = sorted(row["id"] for batch in builder.new_read().read(restored) for row in batch.to_pylist())
+        assert actual == ([5] if selection in ("slice", "position_shard") else [1, 2, 3, 4, 5])
 
 
 def test_explicit_scan_mode_with_matching_selector_reads_snapshot():

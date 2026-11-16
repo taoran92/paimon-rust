@@ -2103,6 +2103,11 @@ impl SQLContext {
             .await
             .map_err(to_datafusion_error)?;
 
+        let table = crate::table_loader::table_for_mutation(
+            table,
+            &self.dynamic_options.read().unwrap(),
+            "UPDATE",
+        )?;
         crate::update::execute_update(self, update, table, enable_ident_normalization).await
     }
 
@@ -2137,6 +2142,11 @@ impl SQLContext {
             .map_err(to_datafusion_error)?;
 
         let table_ref = table_name.to_string();
+        let table = crate::table_loader::table_for_mutation(
+            table,
+            &self.dynamic_options.read().unwrap(),
+            "DELETE",
+        )?;
         crate::delete::execute_delete(self, delete, table, &table_ref).await
     }
 

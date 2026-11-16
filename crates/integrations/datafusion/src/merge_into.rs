@@ -111,6 +111,7 @@ pub(crate) fn plan_merge(
     on: Expr,
     mut clauses: Vec<MergeIntoClause>,
 ) -> DFResult<Arc<dyn ExecutionPlan>> {
+    crate::table_loader::ensure_no_fallback_for_mutation(&table, "MERGE INTO")?;
     if table.is_branch_reference() {
         return Err(DataFusionError::Plan(format!(
             "MERGE INTO on Paimon branch '{}' is not supported",

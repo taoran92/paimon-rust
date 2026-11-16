@@ -72,10 +72,11 @@ pub(super) async fn validate(
             scan.table = ScanTable::Owned(Arc::new(
                 base.table
                     .copy_with_pinned_snapshot(Some(&snapshot))
-                    .copy_with_options(HashMap::from([(
-                        "source.split.target-size".into(),
-                        "1b".into(),
-                    )])),
+                    .copy_with_options(HashMap::from([
+                        ("source.split.target-size".into(), "1b".into()),
+                        // Prove membership in the authorized branch's own snapshot.
+                        ("scan.fallback-branch".into(), String::new()),
+                    ])),
             ));
             scan.scan_all_files = splits.iter().any(|s| {
                 s.snapshot_id() == split.snapshot_id()

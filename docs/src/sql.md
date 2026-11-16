@@ -1081,6 +1081,14 @@ The table type determines which row-level DML operations are supported:
 
 A data-evolution row-tracking table must have both `'data-evolution.enabled' = 'true'` and `'row-tracking.enabled' = 'true'`, and must not have primary keys. `DELETE` and matched `DELETE` in `MERGE INTO` additionally require `'deletion-vectors.enabled' = 'true'`. Primary-key row-level `UPDATE` and `MERGE INTO` are not supported.
 
+`UPDATE`, `DELETE`, and `MERGE INTO` reject targets whose `scan.fallback-branch`
+names a branch other than the current branch, even if the named branch does
+not exist. Rows read from backup cannot be mutated through main.
+Disable fallback on the target first, for example with
+`SET 'paimon.scan.fallback-branch' = ''`. Empty values and the current branch name
+are no-ops; ordinary `INSERT` remains supported. See
+[Fallback Branch Reading](fallback-branch.md) for the read semantics.
+
 ### INSERT INTO
 
 ```sql
@@ -2399,6 +2407,23 @@ All DataFusion query capabilities are supported (JOINs, aggregations, subqueries
 ```sql
 SELECT id, name FROM paimon.my_db.users WHERE id > 10 ORDER BY id LIMIT 100;
 ```
+
+### Reading with a Fallback Branch
+
+Set `paimon.scan.fallback-branch` to fill missing partitions from another branch
+of the same table. The current branch takes precedence for each partition it
+contains.
+
+```sql
+SET 'paimon.scan.fallback-branch' = 'backup';
+SELECT * FROM paimon.my_db.users;
+
+-- Disable fallback for subsequent statements, including row-level mutations.
+SET 'paimon.scan.fallback-branch' = '';
+```
+
+The setting applies to the session. See [Fallback Branch Reading](fallback-branch.md)
+for schema requirements, snapshot selection, and supported operations.
 
 ### Variant Queries
 

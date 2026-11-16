@@ -22,12 +22,19 @@ use crate::table::{RowRange, Table};
 use arrow_array::{Array, Int64Array};
 use futures::TryStreamExt;
 use roaring::RoaringTreemap;
+use std::collections::HashMap;
 
 pub(super) async fn matching_row_ids_for_filter(
     table: &Table,
     filter: &Predicate,
     ranges: Option<Vec<RowRange>>,
 ) -> crate::Result<RoaringTreemap> {
+    // Index row IDs belong to one branch, even when this predicate has no
+    // candidate ranges. Keep the caller's result context and snapshot intact.
+    let table = table.copy_with_options(HashMap::from([(
+        "scan.fallback-branch".into(),
+        String::new(),
+    )]));
     let mut read_builder = table.new_read_builder();
     read_builder
         .with_projection(&[ROW_ID_FIELD_NAME])?

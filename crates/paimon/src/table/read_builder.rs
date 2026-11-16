@@ -73,6 +73,25 @@ pub(super) fn split_scan_predicates(
     }
 }
 
+/// Rebind a normalized partition predicate to full-table indices for row evaluation.
+pub(super) fn partition_predicate_on_table(table: &Table, predicate: &Predicate) -> Predicate {
+    let mapping = table
+        .schema()
+        .partition_keys()
+        .iter()
+        .map(|name| {
+            table
+                .schema()
+                .fields()
+                .iter()
+                .position(|field| field.name() == name)
+        })
+        .collect::<Vec<_>>();
+    predicate
+        .remap_field_index(&mapping)
+        .expect("partition fields belong to the table schema")
+}
+
 fn bucket_predicate(table: &Table, filter: &Predicate) -> Option<Predicate> {
     let core_options = CoreOptions::new(table.schema().options());
     if core_options.bucket() < 1 && core_options.bucket() != -2 {
@@ -272,6 +291,7 @@ impl<'a> ReadBuilder<'a> {
     }
 
     /// Set Data Evolution row ID ranges `[from, to]` (inclusive).
+    /// IDs belong to the current branch; fallback branches are not scanned.
     /// An empty vector selects no rows. Format tables are not supported.
     pub fn with_row_ranges(&mut self, ranges: Vec<RowRange>) -> &mut Self {
         match &mut self.kind {
@@ -602,6 +622,13 @@ impl<'a> PaimonReadBuilder<'a> {
             scan_limit,
             self.effective_row_ranges(),
         )
+        .with_logical_filters(
+            self.filter
+                .partition_predicate
+                .clone()
+                .filter(|_| self.partition_filter.is_none()),
+            self.derived_row_ranges.is_some() && self.explicit_row_ranges.is_none(),
+        )
         .with_projected_read_field_ids(projected_read_field_ids_with_predicates(
             &read_type,
             &data_predicates,
@@ -663,24 +690,7 @@ impl<'a> PaimonReadBuilder<'a> {
             return predicates;
         }
         if let Some(partition) = &self.filter.partition_predicate {
-            let mapping = self
-                .table
-                .schema()
-                .partition_keys()
-                .iter()
-                .map(|name| {
-                    self.table
-                        .schema()
-                        .fields()
-                        .iter()
-                        .position(|field| field.name() == name)
-                })
-                .collect::<Vec<_>>();
-            predicates.push(
-                partition
-                    .remap_field_index(&mapping)
-                    .expect("partition fields belong to the table schema"),
-            );
+            predicates.push(partition_predicate_on_table(self.table, partition));
         }
         predicates
     }

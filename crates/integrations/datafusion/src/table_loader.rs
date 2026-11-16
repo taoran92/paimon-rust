@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::error::{DataFusionError, Result as DFResult};
@@ -22,6 +23,41 @@ use paimon::catalog::{Catalog, Identifier, LoadedTable};
 use paimon::table::Table;
 
 use crate::error::to_datafusion_error;
+
+const SCAN_FALLBACK_BRANCH: &str = "scan.fallback-branch";
+
+pub(crate) fn table_for_mutation(
+    table: Table,
+    dynamic_options: &HashMap<String, String>,
+    operation: &str,
+) -> DFResult<Table> {
+    // Match the fallback setting used by the target scan while preserving
+    // the catalog's physical write options.
+    let table = match dynamic_options.get(SCAN_FALLBACK_BRANCH) {
+        Some(branch) => table.copy_with_options(HashMap::from([(
+            SCAN_FALLBACK_BRANCH.to_string(),
+            branch.clone(),
+        )])),
+        None => table,
+    };
+    ensure_no_fallback_for_mutation(&table, operation)?;
+    Ok(table)
+}
+
+/// A fallback read can expose rows from a branch the mutation cannot write.
+pub(crate) fn ensure_no_fallback_for_mutation(table: &Table, operation: &str) -> DFResult<()> {
+    if table
+        .schema()
+        .options()
+        .get(SCAN_FALLBACK_BRANCH)
+        .is_some_and(|branch| !branch.trim().is_empty() && branch != table.branch())
+    {
+        return Err(DataFusionError::NotImplemented(format!(
+            "{operation} with scan.fallback-branch is not supported; disable fallback on the target before mutating rows"
+        )));
+    }
+    Ok(())
+}
 
 /// [`Catalog::get_table`] for paths that need a `Table` rather than a
 /// [`paimon::catalog::LoadedTable`], rejecting an engine-served declared

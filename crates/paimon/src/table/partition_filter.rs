@@ -45,7 +45,7 @@ pub(super) fn validate_partition_filter(
 }
 
 /// Per-field min/max bounds for stats-based manifest pruning.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct FieldBounds {
     min: Predicate,
     max: Predicate,
@@ -56,7 +56,7 @@ struct FieldCandidates<'a> {
     values: Vec<Option<&'a Datum>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PartitionFilter {
     /// Multiple known partitions: O(1) entry matching via HashSet,
     /// per-field min/max bounds for manifest-level stats pruning.

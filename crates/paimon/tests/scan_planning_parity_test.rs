@@ -978,3 +978,94 @@ async fn multiple_dv_index_files_apply_to_snapshot_but_not_delta_events() {
         assert_eq!(read_ids(&table, &plan).await, expected);
     }
 }
+
+async fn assert_fallback_position_group_order(limit: bool) {
+    let table = evolution_table("memory:/planning_parity/fallback_group_order").await;
+    append_ids(&table, 0, 2).await;
+    append_ids(&table, 2, 4).await;
+    let write = table.new_write_builder();
+    let mut update = write
+        .new_data_evolution_writer(vec!["value".into()])
+        .unwrap();
+    update
+        .add_matched_batch(
+            RecordBatch::try_from_iter(vec![
+                (
+                    "_ROW_ID",
+                    Arc::new(Int64Array::from(vec![2, 3])) as arrow_array::ArrayRef,
+                ),
+                (
+                    "value",
+                    Arc::new(Int32Array::from(vec![200, 300])) as arrow_array::ArrayRef,
+                ),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+    write
+        .new_commit()
+        .commit(update.prepare_commit().await.unwrap())
+        .await
+        .unwrap();
+    let snapshot = table
+        .snapshot_manager()
+        .get_latest_snapshot()
+        .await
+        .unwrap()
+        .unwrap();
+    TagManager::new(table.file_io().clone(), table.location().into())
+        .create("base", &snapshot)
+        .await
+        .unwrap();
+    BranchManager::new(table.file_io().clone(), table.location().into())
+        .create_branch_from_tag("backup", "base")
+        .await
+        .unwrap();
+    let fallback = table.copy_with_options(HashMap::from([(
+        "scan.fallback-branch".into(),
+        "backup".into(),
+    )]));
+    for table in [&table, &fallback] {
+        let mut builder = table.new_read_builder();
+        if limit {
+            builder.with_limit(1);
+        }
+        for shard in [false, true] {
+            let scan = builder.new_scan();
+            let scan = if shard {
+                scan.with_row_position_shard(0, 1)
+            } else {
+                scan.with_row_position_slice(1, 4)
+            }
+            .unwrap();
+            let plan = scan.plan().await.unwrap();
+            // Backup has exactly the same partition: it contributes no rows.
+            assert!(plan.splits().iter().all(|s| !s.is_fallback()));
+            let expected = match (shard, limit) {
+                (false, false) => vec![1, 2, 3],
+                (false, true) => vec![1],
+                (true, false) => vec![0, 1, 2, 3],
+                (true, true) => vec![0],
+            };
+            assert_eq!(
+                read_column(&builder, &plan, 0).await,
+                expected,
+                "fallback={}, shard={shard}, limit={limit}",
+                table
+                    .schema()
+                    .options()
+                    .contains_key("scan.fallback-branch")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn fallback_position_slice_preserves_group_order() {
+    assert_fallback_position_group_order(false).await;
+}
+
+#[tokio::test]
+async fn fallback_position_limit_preserves_group_order() {
+    assert_fallback_position_group_order(true).await;
+}

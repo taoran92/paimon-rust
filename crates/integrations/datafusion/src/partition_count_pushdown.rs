@@ -146,6 +146,16 @@ fn rewrite_aggregate(aggregate: &Aggregate) -> DFResult<Option<LogicalPlan>> {
         return Ok(None);
     }
 
+    // Partition row counts describe only this branch. Let the normal scan
+    // establish partition ownership and include fallback splits before counting.
+    if table_schema
+        .options()
+        .get("scan.fallback-branch")
+        .is_some_and(|branch| !branch.trim().is_empty() && branch != table.branch())
+    {
+        return Ok(None);
+    }
+
     let partition_keys = table_schema.partition_keys();
     // The synthetic scan must not contain duplicate qualified field names.
     if partition_keys.iter().any(|name| name == ROW_COUNT_COLUMN) {
