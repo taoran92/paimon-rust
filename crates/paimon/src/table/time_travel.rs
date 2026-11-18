@@ -939,42 +939,49 @@ mod tests {
             let data_filtered = filter_column == Some("id");
             let files = if filter_column.is_some() { 1 } else { 2 };
             assert_eq!(stats.base_manifest_files, 0, "{stats:?}");
-            // A partition present only on main requires no second backup planning pass.
-            let scanned = if partition_filtered { 1 } else { 2 };
-            assert_eq!(stats.delta_manifest_files, scanned, "{stats:?}");
+            // Both ownership passes inspect a manifest list. A partition filter
+            // skips backup's manifest and leaves no backup data pass to plan.
+            let matching_branches = if partition_filtered { 1 } else { 2 };
+            let entries_read = 2 * matching_branches;
             assert_eq!(
-                stats.manifest_files_before_partition_pruning, scanned,
+                stats.delta_manifest_files,
+                2 + matching_branches,
                 "{stats:?}"
             );
             assert_eq!(
-                stats.manifest_files_after_partition_pruning, scanned,
+                stats.manifest_files_before_partition_pruning,
+                2 + matching_branches,
                 "{stats:?}"
             );
-            assert_eq!(stats.manifest_entries_read, scanned, "{stats:?}");
+            assert_eq!(
+                stats.manifest_files_after_partition_pruning, entries_read,
+                "{stats:?}"
+            );
+            assert_eq!(stats.manifest_entries_read, entries_read, "{stats:?}");
             assert_eq!(stats.manifest_entries_pruned_by_partition, 0, "{stats:?}");
             assert_eq!(
                 stats.manifest_entries_pruned_by_data_stats,
                 usize::from(data_filtered && !evolution),
                 "{stats:?}"
             );
-            let entries = if partition_filtered { 1 } else { 2 };
             assert_eq!(
-                stats.manifest_entries_after_entry_pruning, entries,
+                stats.manifest_entries_after_entry_pruning, entries_read,
                 "{stats:?}"
             );
-            let after_stats = if evolution { entries } else { files };
+            let data_after_stats = if evolution { matching_branches } else { files };
+            let after_stats = matching_branches + data_after_stats;
             assert_eq!(
                 stats.manifest_entries_after_manifest_filters, after_stats,
                 "{stats:?}"
             );
             assert_eq!(stats.manifest_entries_after_merge, after_stats, "{stats:?}");
             assert_eq!(
-                stats.manifest_entries_after_cross_schema_stats, after_stats,
+                stats.manifest_entries_after_cross_schema_stats, data_after_stats,
                 "{stats:?}"
             );
             assert_eq!(
                 stats.data_evolution_groups_before_stats,
-                if evolution { entries } else { 0 },
+                if evolution { matching_branches } else { 0 },
                 "{stats:?}"
             );
             assert_eq!(
@@ -996,12 +1003,20 @@ mod tests {
         }
         let sliced = fallback
             .new_read_builder()
+            .with_limit(1)
             .new_scan()
             .with_row_position_slice(1, 2)
             .unwrap()
             .plan()
             .await
             .unwrap();
+        assert_eq!(sliced.stats().limit, Some(1));
+        // The DE slice excludes main's row-ID range before its data pass.
+        // An append slice assigns positions after both data passes.
+        assert_eq!(
+            sliced.stats().manifest_entries_read,
+            if evolution { 3 } else { 4 }
+        );
         assert_eq!(sliced.stats().final_splits, 1);
         assert_eq!(sliced.stats().splits_after_limit, 1);
         assert_eq!(sliced.stats().final_files, 1);
@@ -1010,6 +1025,31 @@ mod tests {
             sliced.stats().planned_data_file_bytes,
             sliced.splits()[0].data_files()[0].file_size as u64
         );
+    }
+
+    #[tokio::test]
+    async fn test_fallback_scan_stats_count_pruning_in_ownership_passes() {
+        let (table, backup) = empty_fallback_tables().await;
+        write_and_commit(&table, &batch_v0(vec![1, 2], vec![10, 20])).await;
+        write_and_commit(&backup, &batch_v0(vec![3, 4], vec![10, 30])).await;
+        let predicate = crate::spec::PredicateBuilder::new(table.schema().fields())
+            .equal("value", crate::spec::Datum::Int(10))
+            .unwrap();
+        let plan = table
+            .new_read_builder()
+            .with_filter(predicate)
+            .new_scan()
+            .plan()
+            .await
+            .unwrap();
+        // Each ownership pass prunes one entry. Main owns partition 10, so
+        // only main's two-entry manifest is read again for the output.
+        assert_eq!(plan.stats().manifest_entries_read, 6);
+        assert_eq!(plan.stats().manifest_entries_pruned_by_partition, 3);
+        assert_eq!(plan.stats().manifest_entries_after_entry_pruning, 3);
+        assert_eq!(plan.stats().final_splits, 1);
+        assert_eq!(plan.stats().final_files, 1);
+        assert!(!plan.splits()[0].is_fallback());
     }
 
     async fn check_fallback_branch(mode: &str) {

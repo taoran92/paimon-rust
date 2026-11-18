@@ -183,15 +183,7 @@ impl PaimonTableScan<'_> {
         listing.scan_all_files = true;
         listing.file_scan_options = None;
         let main_entries = match &current {
-            Some(snapshot) => {
-                listing
-                    .read_filtered_manifest_entries(
-                        ManifestListSource::Snapshot(snapshot),
-                        None,
-                        &mut ScanStats::default(),
-                    )
-                    .await?
-            }
+            Some(snapshot) => listing.read_ownership_entries(snapshot, stats).await?,
             None => Vec::new(),
         };
         let owned: HashSet<Vec<u8>> = main_entries
@@ -205,11 +197,7 @@ impl PaimonTableScan<'_> {
         // Use backup's independently authorized pruning before subtracting owned partitions.
         listing.partition_filter = fallback.partition_filter.clone();
         let fallback_entries: Vec<_> = listing
-            .read_filtered_manifest_entries(
-                ManifestListSource::Snapshot(&other_snapshot),
-                None,
-                &mut ScanStats::default(),
-            )
+            .read_ownership_entries(&other_snapshot, stats)
             .await?
             .into_iter()
             .filter(|entry| !owned.contains(entry.partition()))
@@ -332,5 +320,18 @@ impl PaimonTableScan<'_> {
             .await?;
         }
         Ok(Some(Plan::from_splits(snapshot_id, splits)))
+    }
+
+    async fn read_ownership_entries(
+        &self,
+        snapshot: &Snapshot,
+        stats: &mut ScanStats,
+    ) -> crate::Result<Vec<ManifestEntry>> {
+        let mut pass = ScanStats::default();
+        let entries = self
+            .read_filtered_manifest_entries(ManifestListSource::Snapshot(snapshot), None, &mut pass)
+            .await?;
+        stats.accumulate_planning(&pass);
+        Ok(entries)
     }
 }
