@@ -17,7 +17,7 @@
 
 //! Batch partition fallback. Ownership is established before data pruning.
 
-use super::super::ReadSnapshot;
+use super::super::{fallback_read::bind_predicate, ReadSnapshot};
 use super::*;
 
 impl PaimonTableScan<'_> {
@@ -68,6 +68,32 @@ impl PaimonTableScan<'_> {
         let mut fallback = requested.clone();
         fallback.table = ScanTable::Owned(Arc::new(other));
         fallback.query_auth_grant = None;
+        if other_snapshot.is_some() || fallback_query_auth {
+            let source = self.table.schema();
+            let target = fallback.table.schema();
+            for predicate in fallback
+                .data_predicates
+                .iter_mut()
+                .chain(&mut fallback.bucket_predicate)
+            {
+                bind_predicate(predicate, source.fields(), target.fields())?;
+            }
+            let partition = fallback
+                .split_selection
+                .as_mut()
+                .and_then(|s| s.logical_partition_predicate.as_mut());
+            let physical = match &mut fallback.partition_filter {
+                Some(PartitionFilter::Predicate(predicate)) => Some(predicate),
+                _ => None,
+            };
+            for predicate in partition.into_iter().chain(physical) {
+                bind_predicate(
+                    predicate,
+                    &source.partition_fields(),
+                    &target.partition_fields(),
+                )?;
+            }
+        }
         if fallback_query_auth {
             if let Some(predicate) = fallback
                 .split_selection

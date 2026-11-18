@@ -319,7 +319,7 @@ impl<'a> TableRead<'a> {
                 return Err(unsupported("fallback splits require a Paimon table"));
             };
             let other_read = TableRead {
-                kind: TableReadKind::Paimon(read.for_fallback(&other)),
+                kind: TableReadKind::Paimon(read.for_fallback(&other)?),
                 parallelism: self.parallelism,
                 ordered: self.ordered,
             };
@@ -568,12 +568,26 @@ fn execution_parallelism(
 }
 
 impl<'a> PaimonTableRead<'a> {
-    fn for_fallback<'b>(&self, table: &'b Table) -> PaimonTableRead<'b> {
+    fn for_fallback<'b>(&self, table: &'b Table) -> crate::Result<PaimonTableRead<'b>> {
         let mut read = PaimonTableRead {
             table,
-            read_type: super::fallback_read::read_fields(&self.read_type, table),
+            read_type: super::fallback_read::read_fields(&self.read_type, self.table, table)?,
             ..self.clone()
         };
+        for predicate in &mut read.data_predicates {
+            super::fallback_read::bind_predicate(
+                predicate,
+                self.table.schema().fields(),
+                table.schema().fields(),
+            )?;
+        }
+        if let Some(predicate) = &mut read.partition_predicate {
+            super::fallback_read::bind_predicate(
+                predicate,
+                &self.table.schema().partition_fields(),
+                &table.schema().partition_fields(),
+            )?;
+        }
         if table.schema().core_options().query_auth_enabled() {
             // Main may have normalized this logical filter against raw partition
             // values. Backup must evaluate it on its own authorized, masked rows.
@@ -584,7 +598,7 @@ impl<'a> PaimonTableRead<'a> {
                     ));
             }
         }
-        read
+        Ok(read)
     }
 
     /// Create a new TableRead with a specific read type (projected fields).
@@ -732,7 +746,7 @@ impl<'a> PaimonTableRead<'a> {
                 row_filter_factory, parquet_read_budget: Some(Arc::clone(&budget)),
                 resources: None, data_file_read_timing, blob_parallelism, limit, update_read,
             };
-            let other_read = main_read.for_fallback(&other);
+            let other_read = main_read.for_fallback(&other)?;
             let main_splits: Vec<_> = splits.iter().filter(|s| !s.is_fallback()).cloned().collect();
             let other_splits: Vec<_> = splits.iter().filter(|s| s.is_fallback())
                 .cloned().map(|s| s.with_fallback(false).without_query_auth_grant()).collect();
@@ -752,10 +766,18 @@ impl<'a> PaimonTableRead<'a> {
             } else { budget };
             let main_factory = main_read.execution_factory(include_row_kind, Arc::clone(&budget), blob_parallelism);
             let other_factory = other_read.execution_factory(include_row_kind, budget, blob_parallelism);
+            let query_schema = if include_row_kind {
+                audit_schema_for_read_type(&main_read.read_type, false)?
+            } else {
+                crate::arrow::build_read_arrow_schema(&main_read.read_type)?
+            };
             let factory: super::read_execution::SplitReader = Arc::new(move |splits, limit| {
                 if splits[0].is_fallback() {
                     let splits: Vec<_> = splits.iter().cloned().map(|s| s.with_fallback(false)).collect();
-                    other_factory(&splits, limit)
+                    let schema = Arc::clone(&query_schema);
+                    Ok(Box::pin(other_factory(&splits, limit)?.map(move |batch| {
+                        super::fallback_read::query_batch(batch?, &schema)
+                    })))
                 } else {
                     main_factory(splits, limit)
                 }

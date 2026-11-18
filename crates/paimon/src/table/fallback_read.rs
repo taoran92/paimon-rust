@@ -18,7 +18,7 @@
 //! Partition fallback branch resolution shared by batch scans and readers.
 
 use super::{SchemaManager, Table};
-use crate::spec::{DataField, Snapshot, TimeTravelSelector};
+use crate::spec::{DataField, Predicate, Snapshot, TimeTravelSelector};
 use crate::{Error, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -294,21 +294,123 @@ pub(super) fn validate_schema(table: &Table, other: &Table) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn read_fields(fields: &[DataField], other: &Table) -> Vec<DataField> {
+/// The compatible schemas have the same order and nested types (including
+/// child IDs). Only top-level IDs, descriptions and nullability may differ.
+pub(super) fn bind_predicate(
+    predicate: &mut Predicate,
+    source: &[DataField],
+    target: &[DataField],
+) -> Result<()> {
+    match predicate {
+        Predicate::And(children) | Predicate::Or(children) => {
+            for child in children {
+                bind_predicate(child, source, target)?;
+            }
+        }
+        Predicate::Not(child) => bind_predicate(child, source, target)?,
+        Predicate::Leaf { column, .. } if crate::spec::is_reserved_system_field_name(column) => {}
+        Predicate::Leaf { .. } | Predicate::NestedLeaf { .. } => {
+            super::query_auth::reject_noncanonical_leaves(std::slice::from_ref(predicate), source)?;
+            match predicate {
+                Predicate::Leaf {
+                    index, data_type, ..
+                } => {
+                    *data_type = target[*index].data_type().clone();
+                }
+                Predicate::NestedLeaf { index, root, .. } => {
+                    **root = target[*index].clone();
+                }
+                _ => unreachable!(),
+            }
+        }
+        Predicate::AlwaysTrue | Predicate::AlwaysFalse => {}
+    }
+    Ok(())
+}
+
+pub(super) fn read_fields(
+    fields: &[DataField],
+    table: &Table,
+    other: &Table,
+) -> Result<Vec<DataField>> {
+    if other.schema().core_options().query_auth_enabled() {
+        super::query_auth::reject_noncanonical_fields(fields, table.schema().fields())?;
+    }
     fields
         .iter()
         .map(|field| {
-            match other
+            if crate::spec::is_reserved_system_field_name(field.name()) {
+                return Ok(field.clone());
+            }
+            let index = table
                 .schema()
                 .fields()
                 .iter()
-                .find(|candidate| candidate.name() == field.name())
-            {
-                // Projection order, nullability and nested projection belong to the
-                // query; field IDs belong to this branch's schema history.
-                Some(other) => field.clone().with_id(other.id()),
-                None => field.clone(), // system column
-            }
+                .position(|source| source.id() == field.id() && source.name() == field.name())
+                .ok_or_else(|| Error::ConfigInvalid {
+                    message: format!(
+                        "Fallback projection '{}' does not match the query schema",
+                        field.name()
+                    ),
+                })?;
+            let local = &other.schema().fields()[index];
+            // Keep projected ROW children and connector extraction metadata.
+            let data_type = field
+                .data_type()
+                .copy_with_nullable(local.data_type().is_nullable())?;
+            Ok(DataField::new(local.id(), field.name().into(), data_type)
+                .with_description(field.description().map(str::to_owned))
+                .with_default_value(field.default_value().map(str::to_owned)))
         })
         .collect()
+}
+
+/// Readers produce the nullable runtime Arrow type on both branches. Publish
+/// query field IDs after branch-local projection, retaining any reader metadata
+/// (for example resolved BLOBs) and the row count of zero-column projections.
+pub(super) fn query_batch(
+    batch: arrow_array::RecordBatch,
+    query: &arrow_schema::SchemaRef,
+) -> Result<arrow_array::RecordBatch> {
+    let schema = batch.schema();
+    if schema.fields() == query.fields() {
+        return Ok(batch);
+    }
+    if schema.fields().len() != query.fields().len() {
+        return Err(Error::DataInvalid {
+            message: "Fallback batch has a different projection".into(),
+            source: None,
+        });
+    }
+    let fields = schema
+        .fields()
+        .iter()
+        .zip(query.fields())
+        .map(|(local, query)| {
+            if local.name() != query.name() {
+                return Err(Error::DataInvalid {
+                    message: format!(
+                        "Expected fallback column '{}', got '{}'",
+                        query.name(),
+                        local.name()
+                    ),
+                    source: None,
+                });
+            }
+            let mut metadata = local.metadata().clone();
+            metadata.extend(query.metadata().clone());
+            Ok(query.as_ref().clone().with_metadata(metadata))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let schema = arrow_schema::Schema::new_with_metadata(fields, schema.metadata().clone());
+    let (_, arrays, rows) = batch.into_parts();
+    arrow_array::RecordBatch::try_new_with_options(
+        Arc::new(schema),
+        arrays,
+        &arrow_array::RecordBatchOptions::new().with_row_count(Some(rows)),
+    )
+    .map_err(|error| Error::DataInvalid {
+        message: format!("Fallback batch does not match query schema: {error}"),
+        source: Some(Box::new(error)),
+    })
 }

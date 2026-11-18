@@ -5519,6 +5519,144 @@ async fn test_query_auth_asks_about_the_projection_and_the_columns_filters_read(
     );
 }
 
+/// Write real branch files, with the mock catalog serving each branch's own schema.
+async fn filesystem_fallback_branches(g: &Guarded) -> (Table, Table) {
+    let mut options = Options::new();
+    options.set(CatalogOptions::WAREHOUSE, g._tmp.path().to_str().unwrap());
+    let catalog = FileSystemCatalog::new(options).unwrap();
+    let main = catalog.get_table(&g.identifier).await.unwrap();
+    paimon::table::BranchManager::new(main.file_io().clone(), main.location().into())
+        .create_branch("backup")
+        .await
+        .unwrap();
+    let backup = main.copy_with_branch("backup").await.unwrap();
+    (main, backup)
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn test_fallback_nested_filter_and_projected_arrow_schema() {
+    use arrow_array::StructArray;
+    use paimon::spec::RowType;
+    let schema = |nullable, options: &[(&str, &str)]| {
+        let int = DataType::Int(IntType::new());
+        let row = RowType::with_nullable(
+            nullable,
+            vec![
+                DataField::new(1, "x".into(), int.clone()),
+                DataField::new(2, "y".into(), int),
+            ],
+        );
+        let mut builder = Schema::builder()
+            .column("payload", DataType::Row(row))
+            .column("id", DataType::Int(IntType::with_nullable(nullable)));
+        for (key, value) in options {
+            builder = builder.option(*key, *value);
+        }
+        builder.build().unwrap()
+    };
+    let g = written("nested_fallback", |opts| schema(false, opts), vec![]).await;
+    let (main, backup) = filesystem_fallback_branches(&g).await;
+    let physical = paimon::arrow::build_target_arrow_schema(backup.schema().fields()).unwrap();
+    let ArrowDataType::Struct(children) = physical.field(0).data_type() else {
+        unreachable!()
+    };
+    let payload = StructArray::new(
+        children.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![7, 8])),
+            Arc::new(Int32Array::from(vec![70, 80])),
+        ],
+        None,
+    );
+    write_batch(
+        &backup,
+        RecordBatch::try_new(
+            physical,
+            vec![Arc::new(payload), Arc::new(Int32Array::from(vec![1, 2]))],
+        )
+        .unwrap(),
+        "backup",
+    )
+    .await;
+
+    // Independent DDL on main gives payload another ID and permits NULL.
+    let mut primary = serde_json::to_value(schema(true, &[])).unwrap();
+    primary["fields"][0]["id"] = serde_json::json!(4);
+    g.ctx.server.add_table_with_schema(
+        "default",
+        "nested_fallback",
+        serde_json::from_value(primary).unwrap(),
+        main.location(),
+    );
+    for guarded in [false, true] {
+        g.ctx.server.add_table_with_schema(
+            "default",
+            "nested_fallback$branch_backup",
+            schema(false, if guarded { GUARDED } else { &[] }),
+            backup.location(),
+        );
+        if guarded {
+            g.ctx.server.set_auth_response(
+                "default",
+                "nested_fallback$branch_backup",
+                rules(&[int_leaf(1, "id", "GREATER_THAN", 0)], &[]),
+            );
+        }
+        let table = g
+            .ctx
+            .catalog
+            .get_table(&g.identifier)
+            .await
+            .unwrap()
+            .copy_with_options(HashMap::from([(
+                "scan.fallback-branch".into(),
+                "backup".into(),
+            )]));
+        let fields = table.schema().fields();
+        let pb = PredicateBuilder::new(fields);
+        let DataType::Row(row) = fields[0].data_type() else {
+            unreachable!()
+        };
+        let projected = vec![
+            fields[1].clone(),
+            DataField::new(
+                fields[0].id(),
+                "payload".into(),
+                DataType::Row(RowType::new(vec![row.fields()[1].clone()])),
+            ),
+        ];
+        for filtered in [false, true] {
+            let mut builder = table.new_read_builder();
+            builder.with_read_type(projected.clone());
+            if filtered {
+                builder.with_filter(Predicate::and(vec![
+                    pb.equal(pb.nested_field("payload", &["x"]).unwrap(), Datum::Int(7))
+                        .unwrap(),
+                    pb.greater_than("id", Datum::Int(0)).unwrap(),
+                ]));
+            }
+            let batches = read_all(&builder).await.unwrap();
+            assert_eq!(ids(&batches), if filtered { vec![1] } else { vec![1, 2] });
+            let expected = paimon::arrow::build_read_arrow_schema(&projected).unwrap();
+            for batch in batches {
+                assert_eq!(batch.schema(), expected);
+                let payload = column::<StructArray>(&batch, "payload");
+                assert_eq!(payload.num_columns(), 1);
+                assert_eq!(
+                    payload
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .unwrap()
+                        .value(0),
+                    70
+                );
+            }
+        }
+    }
+}
+
 #[cfg(not(windows))]
 #[tokio::test]
 async fn test_fallback_query_auth_keeps_branch_rule_columns_separate() {
