@@ -2084,6 +2084,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_fallback_numeric_version_tag_on_main_only() {
+        let (table, backup) = fallback_time_tables().await;
+        write_and_commit(&table, &batch_v0(vec![2], vec![10])).await;
+        write_and_commit(&backup, &batch_v0(vec![3], vec![20])).await;
+        set_snapshot_time(&table, 1, 100).await;
+        set_snapshot_time(&table, 2, 200).await;
+        set_snapshot_time(&backup, 1, 300).await;
+        let snapshot = table.snapshot_manager().get_snapshot(2).await.unwrap();
+        table.tag_manager().create("1", &snapshot).await.unwrap();
+
+        let tagged = table.copy_with_options(options(&[("scan.tag-name", "1")]));
+        let error = tagged
+            .new_read_builder()
+            .new_scan()
+            .plan()
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("Tag '1' doesn't exist"),
+            "{error}"
+        );
+
+        // Backup has no tag "1". Its snapshot 1 is newer than main's tag,
+        // so commit-time mapping could not have selected it.
+        let version = table.copy_with_options(options(&[("scan.version", "1")]));
+        assert_eq!(read_ids(&version).await, vec![1, 2, 3]);
+        let resolved = version
+            .copy_with_time_travel_strict(HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(read_ids(&resolved).await, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
     async fn test_fallback_branch_snapshot_time_is_not_a_shared_id() {
         let (table, backup) = fallback_time_tables().await;
         write_and_commit(&backup, &batch_v0(vec![2], vec![20])).await;

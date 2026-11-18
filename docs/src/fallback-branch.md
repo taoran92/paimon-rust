@@ -47,7 +47,7 @@ let batches = read
 
 A blank value, the current branch name, or a nonexistent fallback branch leaves
 ordinary reads unchanged. An existing fallback branch without snapshots adds
-no rows to an ordinary read. Reading by tag still requires that tag on both
+no rows to an ordinary read. Setting `scan.tag-name` requires that tag on both
 branches, even when the fallback branch has no snapshots.
 
 See the [Python example](python-binding.md#batch-reads-with-a-fallback-branch)
@@ -84,14 +84,22 @@ read schema. Loading a new table creates a new read view.
 
 ## Snapshot Selection
 
-Snapshot IDs are local to each branch. When using `scan.snapshot-id`, or
-`scan.version` interpreted as a snapshot ID, the fallback branch uses its latest
-snapshot at or before the selected current-branch snapshot's commit time.
+Snapshot IDs are local to each branch. With `scan.snapshot-id`, the fallback
+branch uses its latest snapshot at or before the selected current-branch
+snapshot's commit time. The same time mapping applies when the current branch
+interprets `scan.version` as a snapshot ID.
 
 !!! warning "Fallback Snapshot Availability"
     If the fallback branch has snapshots but none at or before that time, the
     read fails. Set `scan.fallback-branch.allow-earliest-snapshot` to `true` to
     allow its earliest snapshot, which may contain newer data.
+
+As in Java, when `scan.version` selects a tag on the current branch, the
+fallback branch resolves the original version value independently. For example,
+suppose tag `1` points to snapshot 2 on main. Backup has snapshot 1, committed
+later, and has no tag named `1`. With `scan.version=1`, the scan uses main
+snapshot 2 and backup snapshot 1. With `scan.tag-name=1`, the scan fails
+because the tag is missing on backup.
 
 ## Supported Operations
 
