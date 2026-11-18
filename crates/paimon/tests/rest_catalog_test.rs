@@ -5616,10 +5616,27 @@ async fn test_fallback_query_auth_keeps_branch_rule_columns_separate() {
         .iter()
         .all(|columns| columns.as_deref() == Some(&["id".to_string()])));
 
+    let main_requests = g.ctx.server.auth_selects("default", "fallback_rules").len();
+    let mut limited = fallback.new_read_builder();
+    limited.with_projection(&["id"]).unwrap().with_limit(0);
+    assert!(limited.new_scan().plan().await.unwrap().splits().is_empty());
+    assert_eq!(
+        g.ctx.server.auth_selects("default", "fallback_rules").len(),
+        main_requests + 1
+    );
+    assert_eq!(
+        g.ctx
+            .server
+            .auth_selects("default", "fallback_rules$branch_backup")
+            .len(),
+        requests.len() + 1
+    );
+
     // A user explicitly requesting the same column must still be denied.
     let mut projected = fallback.new_read_builder();
     projected.with_projection(&["id", "secret"]).unwrap();
     assert_forbidden(read_all(&projected).await.unwrap_err());
+    assert_forbidden(projected.with_limit(0).new_scan().plan().await.unwrap_err());
     let empty = fallback.copy_with_pinned_snapshot(None);
     let mut projected = empty.new_read_builder();
     projected.with_projection(&["id", "secret"]).unwrap();

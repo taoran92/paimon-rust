@@ -1321,6 +1321,9 @@ async fn primary_key_blob_payload_limit_keeps_later_buckets() {
                 .value(0),
             id as i32
         );
+        let empty = builder.with_limit(0).new_scan().plan().await.unwrap();
+        assert!(empty.splits().is_empty());
+        assert_eq!(empty.stats().limit, Some(0));
     }
 }
 

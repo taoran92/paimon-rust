@@ -607,9 +607,10 @@ impl<'a> PaimonReadBuilder<'a> {
         let data_predicates = self.scan_data_predicates();
         let scan_predicates =
             super::managed_blob_reader::scan_predicates(self.table, &data_predicates);
-        // A payload predicate is evaluated after descriptor resolution. A
-        // scan limit must not count rows which may fail that residual filter.
-        let scan_limit = if scan_predicates.len() == data_predicates.len() {
+        // Payload predicates run after descriptor resolution. Positive limits
+        // must not count rows which may fail that residual filter.
+        let scan_limit = if self.limit == Some(0) || scan_predicates.len() == data_predicates.len()
+        {
             self.limit
         } else {
             None

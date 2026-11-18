@@ -56,10 +56,6 @@ impl PaimonTableScan<'_> {
             });
         }
 
-        // Position slices and chunk distribution apply once to the combined
-        // input. Applying a slice separately would restart its offset in each
-        // branch and omit rows; LIMIT must not truncate either input first.
-        let mut main_scan = self.clone();
         // Main's authorization may add rule-only columns and remove unsafe
         // pruning predicates. Authorize backup from the user's original scan,
         // so each branch expands only its own rule dependencies.
@@ -106,10 +102,32 @@ impl PaimonTableScan<'_> {
             );
         }
         let mut fallback = fallback.authorized_scan().await?.into_owned();
-        let Some(other_snapshot) = other_snapshot else {
-            self.check_planned_files().await?;
-            fallback.check_planned_files().await?;
-            return Ok(Some(Plan::new(Vec::new())));
+        let other_snapshot = match other_snapshot {
+            Some(snapshot) if self.limit != Some(0) => snapshot,
+            selection => {
+                if selection.is_some() {
+                    // LIMIT 0 skips ownership I/O, but still validates the
+                    // manifest options of each branch we would have scanned.
+                    if current.is_some() {
+                        self.table
+                            .schema()
+                            .core_options()
+                            .scan_manifest_parallelism()?;
+                    }
+                    fallback
+                        .table
+                        .schema()
+                        .core_options()
+                        .scan_manifest_parallelism()?;
+                    stats.record_split_planning(0, true);
+                }
+                self.check_planned_files().await?;
+                fallback.check_planned_files().await?;
+                return Ok(Some(Plan::from_splits(
+                    current.as_ref().map(Snapshot::id),
+                    Vec::new(),
+                )));
+            }
         };
         let tracks_ids = |table: &Table| {
             let options = table.schema().core_options();
@@ -132,7 +150,10 @@ impl PaimonTableScan<'_> {
             // Comparisons represented by these ranges cannot match a NULL row ID.
             fallback.row_ranges = (!skip_backup).then_some(ranges);
         }
-        // Both branches have now checked the original selection against their own rules.
+        // Position slices and chunk distribution apply once to the combined
+        // input. Applying a slice separately would restart its offset in each
+        // branch and omit rows; LIMIT must not truncate either input first.
+        let mut main_scan = self.clone();
         if self.row_position_selection().is_some() || self.chunk_shuffle().is_some() {
             for scan in [&mut main_scan, &mut fallback] {
                 scan.split_selection.as_mut().unwrap().mode = None;

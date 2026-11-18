@@ -471,6 +471,9 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(read_builder_ids(&builder).await, vec![1, 2]);
+        let plan = builder.with_limit(0).new_scan().plan().await.unwrap();
+        assert!(plan.splits().is_empty());
+        assert_eq!(plan.stats().limit, Some(0));
     }
 
     #[tokio::test]
@@ -733,6 +736,12 @@ mod tests {
                     .new_scan()
                     .with_row_position_shard(1, 3)
                     .unwrap(),
+                table
+                    .new_read_builder()
+                    .with_limit(0)
+                    .new_scan()
+                    .with_row_position_slice(0, 1)
+                    .unwrap(),
             ] {
                 assert!(matches!(
                     scan.plan().await,
@@ -812,6 +821,69 @@ mod tests {
             assert_eq!(ids, vec![1, 2]);
         }
         assert_eq!(read_ids(&fallback).await, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_fallback_zero_limit_with_row_positions() {
+        for mode in ["append", "evolution"] {
+            let table = fallback_with_layout(mode, mode).await;
+            let scan = table.new_read_builder().with_limit(0).new_scan();
+            for positioned in [
+                scan.clone().with_row_position_slice(0, 1).unwrap(),
+                scan.with_row_position_shard(1, 2).unwrap(),
+            ] {
+                let plan = positioned.plan().await.unwrap();
+                assert_eq!(plan.splits().len(), 0);
+                assert_eq!(plan.snapshot_id(), Some(1));
+                assert_eq!(
+                    plan.stats(),
+                    &crate::table::ScanStats {
+                        limit: Some(0),
+                        limit_early_stopped: true,
+                        ..Default::default()
+                    }
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fallback_zero_limit_skips_ownership_manifests() {
+        let (table, backup) = empty_fallback_tables().await;
+        for (branch, value, main_id) in [(&backup, 20, None), (&table, 10, Some(1))] {
+            write_and_commit(branch, &batch_v0(vec![1], vec![value])).await;
+            // A manifest read would now fail even if its stats were discarded.
+            let manager = branch.snapshot_manager();
+            let snapshot = manager.get_snapshot(1).await.unwrap();
+            branch
+                .file_io()
+                .delete_file(&manager.manifest_path(snapshot.delta_manifest_list()))
+                .await
+                .unwrap();
+            let plan = table
+                .new_read_builder()
+                .with_limit(0)
+                .new_scan()
+                .plan()
+                .await
+                .unwrap();
+            assert!(plan.splits().is_empty());
+            assert_eq!(plan.snapshot_id(), main_id);
+            assert!(plan.stats().limit_early_stopped);
+            assert_eq!(plan.stats().limit, Some(0));
+        }
+        let invalid = table.copy_with_options(options(&[("scan.manifest.parallelism", "0")]));
+        let error = invalid
+            .new_read_builder()
+            .with_limit(0)
+            .new_scan()
+            .plan()
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("scan.manifest.parallelism"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
