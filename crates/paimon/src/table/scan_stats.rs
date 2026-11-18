@@ -30,6 +30,9 @@ use std::fmt;
 #[non_exhaustive]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanStats {
+    /// Planning visited a branch with row filters or masks, even if that
+    /// branch contributed no splits. Its counters describe unrestricted files.
+    pub has_query_auth_rules: bool,
     pub base_manifest_files: usize,
     pub delta_manifest_files: usize,
     pub manifest_files_before_partition_pruning: usize,
@@ -67,6 +70,7 @@ impl ScanStats {
     /// Combine independent planning stages. Keep the query's LIMIT hint;
     /// final split/file counts and bytes are refreshed from the combined Plan.
     pub(crate) fn accumulate_planning(&mut self, other: &Self) {
+        self.has_query_auth_rules |= other.has_query_auth_rules;
         self.base_manifest_files += other.base_manifest_files;
         self.delta_manifest_files += other.delta_manifest_files;
         self.manifest_files_before_partition_pruning +=
@@ -111,6 +115,9 @@ impl ScanStats {
 
 impl fmt::Display for ScanStats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.has_query_auth_rules {
+            return f.write_str("query-auth=restricted");
+        }
         write!(
             f,
             "manifests={}/{}, manifest_row_range_pruned={}, entries_read={}, bucket_pruned={}, partition_pruned={}, entry_row_range_pruned={}, data_stats_pruned={}, cross_schema_pruned={}, split_candidates_built={}, limit_early_stopped={}, splits_before_limit={}, splits_after_limit={}, files={}, data_file_bytes={}",

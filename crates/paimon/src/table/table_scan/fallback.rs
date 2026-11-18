@@ -134,6 +134,10 @@ impl PaimonTableScan<'_> {
             );
         }
         let mut fallback = fallback.authorized_scan().await?.into_owned();
+        stats.has_query_auth_rules |= fallback
+            .query_auth_grant
+            .as_ref()
+            .is_some_and(|grant| !grant.is_unrestricted());
         let other_snapshot = match other_snapshot {
             Some(snapshot) if self.limit != Some(0) => snapshot,
             selection => {

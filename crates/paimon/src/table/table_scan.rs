@@ -1989,6 +1989,10 @@ impl<'a> PaimonTableScan<'a> {
 
     async fn plan_selection(&self, stats: &mut ScanStats) -> crate::Result<Plan> {
         let scan = self.authorized_scan().await?;
+        stats.has_query_auth_rules |= scan
+            .query_auth_grant
+            .as_ref()
+            .is_some_and(|grant| !grant.is_unrestricted());
         stats.limit = scan.limit;
         if let Some(plan) = scan.supplied_split_plan() {
             stats.record_split_planning(plan.splits().len(), false);

@@ -1012,10 +1012,14 @@ impl PaimonTableScan {
 
     /// Planned under the server's rules: counts and bounds precede them.
     fn has_query_auth_rules(&self) -> bool {
-        self.planned_partitions
-            .iter()
-            .flat_map(|splits| splits.iter())
-            .any(DataSplit::has_query_auth_rules)
+        self.scan_stats
+            .as_ref()
+            .is_some_and(|stats| stats.has_query_auth_rules)
+            || self
+                .planned_partitions
+                .iter()
+                .flat_map(|splits| splits.iter())
+                .any(DataSplit::has_query_auth_rules)
     }
 
     fn manifest_column_statistics(&self, partitions: &[Arc<[DataSplit]>]) -> Vec<ColumnStatistics> {
@@ -1956,6 +1960,44 @@ mod tests {
                 assert_eq!(column.null_count, Precision::Absent);
                 assert_eq!(column.min_value, Precision::Absent);
                 assert_eq!(column.max_value, Precision::Absent);
+            }
+        }
+    }
+
+    #[test]
+    fn test_shadowed_fallback_statistics_in_explain() {
+        for restricted in [true, false] {
+            let mut stats = ScanStats::default();
+            stats.has_query_auth_rules = restricted;
+            stats.manifest_entries_read = 5;
+            let scan = PaimonTableScan::new(
+                test_schema(),
+                dummy_table(),
+                test_read_type(),
+                None,
+                vec![Arc::from(vec![split_with_int_stats(None, None)])],
+                None,
+                true,
+                Some(stats),
+                None,
+                true,
+            );
+            let explain = datafusion::physical_plan::displayable(&scan)
+                .one_line()
+                .to_string();
+            let statistics = scan
+                .statistics_from_inputs(&[], &StatisticsArgs::new())
+                .unwrap();
+            if restricted {
+                assert!(explain.contains("query-auth=restricted"), "{explain}");
+                for label in ["partitions=", "splits=", "files=", "stats="] {
+                    assert!(!explain.contains(label), "{explain}");
+                }
+                assert_eq!(statistics.num_rows, Precision::Absent);
+                assert_eq!(statistics.column_statistics[0].min_value, Precision::Absent);
+            } else {
+                assert!(explain.contains("entries_read=5"), "{explain}");
+                assert_eq!(statistics.num_rows, Precision::Exact(4));
             }
         }
     }

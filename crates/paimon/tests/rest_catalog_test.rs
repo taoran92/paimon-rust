@@ -6044,6 +6044,7 @@ async fn test_fallback_query_auth_partition_masks_preserve_ownership() {
                 main.location(),
             );
         }
+        let main_writer = main;
         let main = g.ctx.catalog.get_table(&g.identifier).await.unwrap();
         let backup = main.copy_with_branch("backup").await.unwrap();
         let fallback = main.copy_with_options(HashMap::from([(
@@ -6146,6 +6147,11 @@ async fn test_fallback_query_auth_partition_masks_preserve_ownership() {
                 }
                 let reader = builder.new_read().unwrap();
                 let plan = builder.new_scan().plan().await.unwrap();
+                assert_eq!(
+                    plan.stats().has_query_auth_rules,
+                    main_mask || backup_mask,
+                    "{label}"
+                );
                 if predicate.is_some() {
                     // The server rules on the projected column and the partition
                     // column used only by WHERE, independently on each branch.
@@ -6216,6 +6222,19 @@ async fn test_fallback_query_auth_partition_masks_preserve_ownership() {
                     .unwrap();
                 assert_eq!(ids(&batches), vec![2], "position slice: {label}");
             }
+        }
+        if !main_auth && !primary_key && !data_evolution {
+            write_batch(&main_writer, batch(vec![5], vec!["eng"]), "shadow").await;
+            g.ctx.server.set_auth_response(
+                "default",
+                "fallback_masks$branch_backup",
+                rules(&[], &[("pt", upper(1, "pt"))]),
+            );
+            let plan = fallback.new_read_builder().new_scan().plan().await.unwrap();
+            assert!(!plan.splits().is_empty());
+            assert!(plan.splits().iter().all(|s| !s.is_fallback()));
+            assert!(plan.stats().has_query_auth_rules);
+            assert!(plan.stats().manifest_entries_read > 0);
         }
     }
 }
