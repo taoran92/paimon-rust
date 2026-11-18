@@ -5535,6 +5535,154 @@ async fn filesystem_fallback_branches(g: &Guarded) -> (Table, Table) {
 
 #[cfg(not(windows))]
 #[tokio::test]
+async fn test_fallback_catalog_snapshot_time_mapping_and_latest_read() {
+    let schema = |opts: &[(&str, &str)]| {
+        let mut builder = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .partition_keys(["id"]);
+        for (key, value) in opts {
+            builder = builder.option(*key, *value);
+        }
+        builder.build().unwrap()
+    };
+    let batch = |id| {
+        RecordBatch::try_from_iter([(
+            "id",
+            Arc::new(Int32Array::from(vec![id])) as arrow_array::ArrayRef,
+        )])
+        .unwrap()
+    };
+    let g = written("catalog_head", schema, vec![]).await;
+    let (main, backup) = filesystem_fallback_branches(&g).await;
+    write_batch(&backup, batch(2), "first").await;
+    write_batch(&main, batch(1), "main").await;
+    write_batch(&backup, batch(3), "second").await;
+    let manager = backup.snapshot_manager();
+    let first = manager.get_snapshot(1).await.unwrap();
+    let second = manager.get_snapshot(2).await.unwrap();
+    let time = main
+        .snapshot_manager()
+        .get_snapshot(1)
+        .await
+        .unwrap()
+        .time_millis();
+    let branch = "catalog_head$branch_backup";
+    g.ctx
+        .server
+        .add_table_with_schema("default", branch, schema(GUARDED), main.location());
+    g.ctx.server.set_auth_response(
+        "default",
+        branch,
+        rules(&[int_leaf(0, "id", "GREATER_THAN", 1)], &[]),
+    );
+    let serve = |snapshot: &paimon::spec::Snapshot, time| {
+        let mut json = serde_json::to_value(snapshot).unwrap();
+        json["timeMillis"] = serde_json::json!(time);
+        g.ctx
+            .server
+            .set_catalog_snapshot("default", branch, serde_json::from_value(json).unwrap());
+    };
+    let fallback = g.table.copy_with_options(HashMap::from([(
+        "scan.fallback-branch".into(),
+        "backup".into(),
+    )]));
+    let historical = |allow: bool| {
+        fallback.copy_with_options(HashMap::from([
+            ("scan.snapshot-id".into(), "1".into()),
+            (
+                "scan.fallback-branch.allow-earliest-snapshot".into(),
+                allow.to_string(),
+            ),
+        ]))
+    };
+    manager.delete_snapshot(2).await.unwrap();
+    serve(&second, time);
+    // The eligible catalog head wins over the older copy still on disk.
+    assert_eq!(
+        ids(&read_all(&historical(false).new_read_builder())
+            .await
+            .unwrap()),
+        [1, 2, 3]
+    );
+    serve(&second, time + 1);
+    assert_eq!(
+        ids(&read_all(&historical(false).new_read_builder())
+            .await
+            .unwrap()),
+        [1, 2]
+    );
+
+    manager.delete_snapshot(1).await.unwrap();
+    for allow in [false, true] {
+        let error = historical(allow)
+            .new_read_builder()
+            .new_scan()
+            .plan()
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("history is unavailable"),
+            "{error}"
+        );
+    }
+    serve(&first, time + 1);
+    let error = historical(false)
+        .new_read_builder()
+        .new_scan()
+        .plan()
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("allow-earliest-snapshot"),
+        "{error}"
+    );
+    assert_eq!(
+        ids(&read_all(&historical(true).new_read_builder())
+            .await
+            .unwrap()),
+        [1, 2]
+    );
+
+    // Ordinary latest plans may advance. The serialized split still names
+    // snapshot 1 and cannot be restored from a different catalog head.
+    let builder = fallback.new_read_builder();
+    let read = builder.new_read().unwrap();
+    let plan = builder.new_scan().plan().await.unwrap();
+    assert_eq!(
+        ids(&read
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()),
+        [1, 2]
+    );
+    let split = plan.splits().iter().find(|s| s.is_fallback()).unwrap();
+    let transported =
+        paimon::DataSplit::deserialize_split_v1(&split.serialize_split_v1().unwrap()).unwrap();
+    let restored = read
+        .authorize_splits(std::slice::from_ref(&transported))
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(&read
+            .to_arrow(&restored)
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()),
+        [2]
+    );
+    serve(&second, time + 2);
+    assert_eq!(ids(&read_all(&builder).await.unwrap()), [1, 2, 3]);
+    assert!(matches!(
+        read.authorize_splits(&[transported]).await,
+        Err(paimon::Error::SnapshotNotExist { snapshot_id: 1 })
+    ));
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
 async fn test_fallback_nested_filter_and_projected_arrow_schema() {
     use arrow_array::StructArray;
     use paimon::spec::RowType;

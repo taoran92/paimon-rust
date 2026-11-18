@@ -115,10 +115,23 @@ impl SnapshotManager {
     ///
     /// Reference: [HintFileUtils.readHint](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/utils/HintFileUtils.java)
     async fn read_hint(&self, path: &str) -> Option<i64> {
-        let input = self.file_io.new_input(path).ok()?;
-        let content = input.read().await.ok()?;
-        let id_str = str::from_utf8(&content).ok()?;
-        id_str.trim().parse().ok()
+        self.try_read_hint(path).await.ok().flatten()
+    }
+
+    async fn try_read_hint(&self, path: &str) -> crate::Result<Option<i64>> {
+        let input = self.file_io.new_input(path)?;
+        let content = match input.read().await {
+            Ok(content) => content,
+            Err(crate::Error::IoUnexpected { source, .. })
+                if source.kind() == opendal::ErrorKind::NotFound =>
+            {
+                return Ok(None)
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(str::from_utf8(&content)
+            .ok()
+            .and_then(|id| id.trim().parse().ok()))
     }
 
     /// List snapshot files and find the id using the given reducer (min or max).
@@ -499,6 +512,77 @@ impl SnapshotManager {
             }
         }
         Ok(result)
+    }
+
+    /// Map a main snapshot's commit time onto this branch. A REST head may
+    /// have no snapshot file, or the disk listing may lag or outlive that head.
+    pub(super) async fn fallback_snapshot_at_time(
+        &self,
+        time: u64,
+        allow_earliest: bool,
+    ) -> crate::Result<Option<Snapshot>> {
+        let earliest = if self.rest_env.is_some() {
+            let Some(head) = self.get_latest_snapshot().await? else {
+                return Ok(None);
+            };
+            if head.time_millis() <= time {
+                return Ok(Some(head));
+            }
+            // Locate neighbors of the requested time within the authoritative
+            // head. A missing ID between them might be a later eligible commit.
+            let ids = self.list_all_ids().await?;
+            let mut lo = 0;
+            let mut hi = ids.partition_point(|id| *id < head.id());
+            let mut before = None;
+            let mut after = head;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let snapshot = self.get_snapshot(ids[mid]).await?;
+                if snapshot.time_millis() <= time {
+                    before = Some(snapshot);
+                    lo = mid + 1;
+                } else {
+                    after = snapshot;
+                    hi = mid;
+                }
+            }
+            let unavailable = || crate::Error::DataInvalid {
+                message: format!(
+                    "Fallback branch '{}' snapshot history is unavailable for commit time {time}",
+                    self.branch
+                ),
+                source: None,
+            };
+            if let Some(snapshot) = before {
+                return if snapshot.id() + 1 == after.id() {
+                    Ok(Some(snapshot))
+                } else {
+                    Err(unavailable())
+                };
+            }
+            // A later catalog snapshot alone says nothing about the first
+            // retained ID. Expiration can record it explicitly in EARLIEST.
+            if after.id() != 1
+                && self.try_read_hint(&self.earliest_hint_path()).await? != Some(after.id())
+            {
+                return Err(unavailable());
+            }
+            after
+        } else {
+            if let Some(snapshot) = self.earlier_or_equal_time_millis(time as i64).await? {
+                return Ok(Some(snapshot));
+            }
+            let Some(id) = self.earliest_snapshot_id().await? else {
+                return Ok(None);
+            };
+            self.get_snapshot(id).await?
+        };
+        if !allow_earliest {
+            return Err(crate::Error::ConfigInvalid {
+                message: format!("No snapshot of fallback branch '{}' exists at or before the requested snapshot; set scan.fallback-branch.allow-earliest-snapshot=true to allow its earliest snapshot", self.branch),
+            });
+        }
+        Ok(Some(earliest))
     }
 
     #[deprecated(note = "Renamed to earlier_or_equal_time_millis")]

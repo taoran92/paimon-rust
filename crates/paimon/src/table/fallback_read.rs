@@ -169,14 +169,25 @@ impl Table {
             Some(snapshot) if snapshot.id() == snapshot_id => snapshot.clone(),
             _ => match other.snapshot_manager().get_snapshot(snapshot_id).await {
                 // Tags retain full snapshot metadata after the snapshot file expires.
-                Err(error @ Error::SnapshotNotExist { .. }) => other
-                    .tag_manager()
-                    .list_all()
-                    .await?
-                    .into_iter()
-                    .map(|(_, snapshot)| snapshot)
-                    .find(|snapshot| snapshot.id() == snapshot_id)
-                    .ok_or(error)?,
+                Err(error @ Error::SnapshotNotExist { .. }) => {
+                    let retained = other
+                        .tag_manager()
+                        .list_all()
+                        .await?
+                        .into_iter()
+                        .map(|(_, snapshot)| snapshot)
+                        .find(|snapshot| snapshot.id() == snapshot_id);
+                    match retained {
+                        Some(snapshot) => snapshot,
+                        None if other.rest_env().is_some() => other
+                            .snapshot_manager()
+                            .get_latest_snapshot()
+                            .await?
+                            .filter(|snapshot| snapshot.id() == snapshot_id)
+                            .ok_or(error)?,
+                        None => return Err(error),
+                    }
+                }
                 result => result?,
             },
         };
@@ -246,21 +257,12 @@ impl Table {
             let Some(current) = current else {
                 return Ok(None);
             };
-            if let Some(snapshot) = manager
-                .earlier_or_equal_time_millis(current.time_millis() as i64)
-                .await?
-            {
-                return Ok(Some(snapshot));
-            }
-            let Some(id) = manager.earliest_snapshot_id().await? else {
-                return Ok(None);
-            };
-            if !allow_earliest(self.schema().options()) {
-                return Err(Error::ConfigInvalid {
-                    message: format!("No snapshot of fallback branch '{}' exists at or before the requested snapshot; set scan.fallback-branch.allow-earliest-snapshot=true to allow its earliest snapshot", other.branch()),
-                });
-            }
-            return manager.get_snapshot(id).await.map(Some);
+            return manager
+                .fallback_snapshot_at_time(
+                    current.time_millis(),
+                    allow_earliest(self.schema().options()),
+                )
+                .await;
         }
         if let Some(TimeTravelSelector::TimestampMillis(ts)) = selector {
             return super::time_travel::snapshot_at_timestamp(&manager, ts, true).await;
