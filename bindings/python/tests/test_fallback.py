@@ -116,6 +116,37 @@ def test_fallback_noop_override_allows_mutations(mutation_branches, operation, n
     assert [row["id"] for row in _rows(backup)] == [2]
 
 
+def test_empty_pin_survives_fallback_branch_ddl(tmp_path):
+    options = {"warehouse": str(tmp_path)}
+    ctx = SQLContext()
+    ctx.register_catalog("paimon", options)
+    ctx.sql("CREATE SCHEMA paimon.db")
+    ctx.sql("CREATE TABLE paimon.db.t (id INT, pt INT) PARTITIONED BY (pt)")
+    ctx.sql("CALL sys.create_branch(table => 'db.t', branch => 'primary')")
+    catalog = PaimonCatalog(options)
+
+    def load_primary():
+        primary = catalog.get_table("db.t").copy({"branch": "primary"})
+        return primary.copy({"scan.fallback-branch": "main"})
+
+    def assert_empty(table):
+        plan = table.new_read_builder().new_scan().plan()
+        assert plan.snapshot_id() is None
+        assert plan.splits() == []
+
+    early = load_primary().copy_with_pinned_snapshot(None)
+    late = load_primary().copy_with_pinned_snapshot(None)
+    assert_empty(early)
+    ctx.sql("ALTER TABLE paimon.db.t ADD COLUMN amount INT")
+    assert_empty(early)
+    assert_empty(late)
+
+    # A live scan must check the schema once main has a data snapshot, even at LIMIT 0.
+    ctx.sql("INSERT INTO paimon.db.t VALUES (1, 2, 3)")
+    with pytest.raises(ValueError, match="must have the same row type"):
+        load_primary().new_read_builder().with_limit(0).new_scan().plan()
+
+
 @pytest.mark.parametrize("copied", [False, True])
 def test_fallback_resolved_snapshot_preserves_read_schema(mutation_branches, copied):
     from pypaimon_rust.datafusion import Split, Table

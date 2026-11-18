@@ -43,11 +43,17 @@ impl PaimonTableScan<'_> {
             }
             snapshot => other.copy_with_pinned_snapshot(snapshot),
         };
-        super::super::fallback_read::validate_schema(&self.table, &other)?;
+        let fallback_query_auth = other.schema().core_options().query_auth_enabled();
+        // An empty pin has no files to read, but backup authorization still
+        // maps the requested projection and partition predicates across schemas.
+        if other_snapshot.is_some() || fallback_query_auth {
+            super::super::fallback_read::validate_schema(&self.table, &other)?;
+        }
         // DE positions count complete row-ID domains before pruning, whereas
         // ordinary append positions count the final stats-pruned physical rows.
         // Neither rule can be applied to both layouts in one positional scan.
-        if self.row_position_selection().is_some()
+        if other_snapshot.is_some()
+            && self.row_position_selection().is_some()
             && self.table.schema().core_options().data_evolution_enabled()
                 != other.schema().core_options().data_evolution_enabled()
         {
@@ -62,7 +68,7 @@ impl PaimonTableScan<'_> {
         let mut fallback = requested.clone();
         fallback.table = ScanTable::Owned(Arc::new(other));
         fallback.query_auth_grant = None;
-        if fallback.table.schema().core_options().query_auth_enabled() {
+        if fallback_query_auth {
             if let Some(predicate) = fallback
                 .split_selection
                 .as_mut()

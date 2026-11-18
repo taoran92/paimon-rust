@@ -5652,6 +5652,49 @@ async fn test_fallback_query_auth_keeps_branch_rule_columns_separate() {
 
 #[cfg(not(windows))]
 #[tokio::test]
+async fn test_empty_fallback_pin_checks_partition_layout_before_authorization() {
+    let ctx = setup_catalog(vec!["default"]).await;
+    let path = "memory:/fallback-auth-layout";
+    let primary = Schema::builder()
+        .column("pt", DataType::Int(IntType::new()))
+        .partition_keys(["pt"])
+        .option("scan.fallback-branch", "backup")
+        .build()
+        .unwrap();
+    ctx.server
+        .add_table_with_schema("default", "t", primary, path);
+    ctx.server.add_table_with_schema(
+        "default",
+        "t$branch_backup",
+        schema_of(&["pt"], GUARDED),
+        path,
+    );
+    let table = ctx
+        .catalog
+        .get_table(&Identifier::new("default", "t"))
+        .await
+        .unwrap()
+        .copy_with_pinned_snapshot(None);
+    let predicate = PredicateBuilder::new(table.schema().fields())
+        .equal("pt", Datum::Int(1))
+        .unwrap();
+    // The primary's partition predicate has no corresponding slot on backup.
+    let error = table
+        .new_read_builder()
+        .with_filter(predicate)
+        .new_scan()
+        .plan()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, paimon::Error::ConfigInvalid { ref message }
+        if message.contains("partition keys")),
+        "{error}"
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
 async fn test_fallback_query_auth_partition_masks_preserve_ownership() {
     for (primary_key, data_evolution, main_auth) in [
         (false, false, true),
