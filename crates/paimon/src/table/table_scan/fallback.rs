@@ -17,6 +17,7 @@
 
 //! Batch partition fallback. Ownership is established before data pruning.
 
+use super::super::ReadSnapshot;
 use super::*;
 
 impl PaimonTableScan<'_> {
@@ -33,13 +34,14 @@ impl PaimonTableScan<'_> {
             .table
             .fallback_snapshot(&other, current.as_ref())
             .await?;
-        let Some(other_snapshot) = other_snapshot else {
-            return Ok(None);
-        };
-        let other = if self.table.fallback_uses_snapshot_schema() {
-            other.copy_with_resolved_snapshot(&other_snapshot).await?
-        } else {
-            other.copy_with_pinned_snapshot(Some(&other_snapshot))
+        let other = match other_snapshot.as_ref() {
+            Some(snapshot) if self.table.fallback_uses_snapshot_schema() => {
+                other.copy_with_resolved_snapshot(snapshot).await?
+            }
+            None if !matches!(self.table.travel_snapshot, Some(ReadSnapshot::Empty)) => {
+                return Ok(None);
+            }
+            snapshot => other.copy_with_pinned_snapshot(snapshot),
         };
         super::super::fallback_read::validate_schema(&self.table, &other)?;
         // DE positions count complete row-ID domains before pruning, whereas
@@ -104,6 +106,11 @@ impl PaimonTableScan<'_> {
             );
         }
         let mut fallback = fallback.authorized_scan().await?.into_owned();
+        let Some(other_snapshot) = other_snapshot else {
+            self.check_planned_files().await?;
+            fallback.check_planned_files().await?;
+            return Ok(Some(Plan::new(Vec::new())));
+        };
         let tracks_ids = |table: &Table| {
             let options = table.schema().core_options();
             options.row_tracking_enabled() || options.data_evolution_enabled()

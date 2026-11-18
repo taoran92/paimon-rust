@@ -1823,7 +1823,7 @@ mod tests {
         assert_eq!(ages, vec![Some(222)]);
     }
 
-    async fn fallback_time_tables() -> (Table, Table) {
+    async fn empty_fallback_tables() -> (Table, Table) {
         let file_io = FileIOBuilder::new("memory").build().unwrap();
         let path = "memory:/fallback-times";
         let schema = Schema::builder()
@@ -1835,7 +1835,6 @@ mod tests {
         let schema = TableSchema::new(0, &schema);
         write_schema_file(&file_io, path, &schema).await;
         let table = make_table(&file_io, path, schema);
-        write_and_commit(&table, &batch_v0(vec![1], vec![10])).await;
         crate::table::BranchManager::new(file_io.clone(), path.into())
             .create_branch("backup")
             .await
@@ -1845,6 +1844,30 @@ mod tests {
             table.copy_with_options(options(&[("scan.fallback-branch", "backup")])),
             backup,
         )
+    }
+
+    async fn fallback_time_tables() -> (Table, Table) {
+        let (table, backup) = empty_fallback_tables().await;
+        write_and_commit(&table, &batch_v0(vec![1], vec![10])).await;
+        (table, backup)
+    }
+
+    #[tokio::test]
+    async fn test_fallback_explicit_empty_pin_before_first_plan() {
+        let (latest, backup) = empty_fallback_tables().await;
+        let planned_early = latest.copy_with_pinned_snapshot(None);
+        let planned_late = latest.copy_with_pinned_snapshot(None);
+        assert!(read_ids(&planned_early.clone()).await.is_empty());
+        write_and_commit(&backup, &batch_v0(vec![2], vec![20])).await;
+
+        assert_eq!(read_ids(&latest).await, vec![2]);
+        for view in [
+            planned_early,
+            planned_late.copy_with_options(options(&[("read.batch-size", "1")])),
+            planned_late,
+        ] {
+            assert_eq!(read_ids(&view).await, Vec::<i32>::new());
+        }
     }
 
     #[tokio::test]

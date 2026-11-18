@@ -5620,6 +5620,10 @@ async fn test_fallback_query_auth_keeps_branch_rule_columns_separate() {
     let mut projected = fallback.new_read_builder();
     projected.with_projection(&["id", "secret"]).unwrap();
     assert_forbidden(read_all(&projected).await.unwrap_err());
+    let empty = fallback.copy_with_pinned_snapshot(None);
+    let mut projected = empty.new_read_builder();
+    projected.with_projection(&["id", "secret"]).unwrap();
+    assert_forbidden(projected.new_scan().plan().await.unwrap_err());
     let mut filtered = fallback.new_read_builder();
     filtered.with_projection(&["id"]).unwrap().with_filter(
         PredicateBuilder::new(fallback.schema().fields())

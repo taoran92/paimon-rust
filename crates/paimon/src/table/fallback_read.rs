@@ -208,6 +208,10 @@ impl Table {
         other: &Table,
         current: Option<&Snapshot>,
     ) -> Result<Option<Snapshot>> {
+        if matches!(self.travel_snapshot, Some(super::ReadSnapshot::Empty)) {
+            // The empty pin captures the whole read view, including fallback.
+            return Ok(None);
+        }
         if self.travel_snapshot.is_some() {
             if let Some(pinned) = self.pinned_fallback_snapshot.get() {
                 return Ok(pinned.as_deref().cloned());
@@ -219,8 +223,8 @@ impl Table {
         let fixed = self.travel_snapshot.is_some()
             || matches!(selector, Some(TimeTravelSelector::SnapshotId { .. }));
         let resolve = self.resolve_fallback_snapshot(other, current, selector);
-        // A resolved view (including a pinned empty main), or an explicit
-        // snapshot ID, has one backup selection for the lifetime of this view.
+        // A resolved view or an explicit snapshot ID has one backup selection
+        // for the lifetime of this view.
         if fixed {
             let pinned = self
                 .pinned_fallback_snapshot
