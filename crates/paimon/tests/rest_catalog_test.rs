@@ -5860,6 +5860,19 @@ async fn test_fallback_query_auth_partition_masks_preserve_ownership() {
                 }
                 let reader = builder.new_read().unwrap();
                 let plan = builder.new_scan().plan().await.unwrap();
+                if predicate.is_some() {
+                    // The server rules on the projected column and the partition
+                    // column used only by WHERE, independently on each branch.
+                    for branch in ["fallback_masks$branch_backup", "fallback_masks"] {
+                        if branch == "fallback_masks" && !main_auth {
+                            continue;
+                        }
+                        let requests = g.ctx.server.auth_selects("default", branch);
+                        let mut columns = requests.last().unwrap().clone().unwrap();
+                        columns.sort();
+                        assert_eq!(columns, ["id", "pt"], "{branch}, {label}");
+                    }
+                }
                 let restored = plan
                     .splits()
                     .iter()

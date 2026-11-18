@@ -2101,12 +2101,13 @@ impl<'a> PaimonTableScan<'a> {
     /// whole table) without a projection.
     fn query_auth_select(&self) -> Option<Vec<String>> {
         let ids = self.projected_read_field_ids.as_ref()?;
+        let operands = super::query_auth::leaf_names(&self.data_predicates);
         let mut select: Vec<String> = self
             .table
             .schema()
             .fields()
             .iter()
-            .filter(|f| ids.contains(&f.id()))
+            .filter(|f| ids.contains(&f.id()) || operands.contains(f.name()))
             .map(|f| f.name().to_string())
             .collect();
         for key in self.partition_filter_columns() {
