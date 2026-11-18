@@ -550,9 +550,8 @@ impl DataSplit {
         self
     }
 
-    pub(crate) fn without_query_auth_grant(mut self) -> Self {
+    pub(crate) fn clear_query_auth_grant(&mut self) {
         self.query_auth_grant = None;
-        self
     }
 
     pub(crate) fn with_read_context(mut self, source: &Self) -> Self {

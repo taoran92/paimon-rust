@@ -40,6 +40,8 @@ pub(crate) struct QueryAuthGrant {
     response: Option<AuthTableQueryResponse>,
     /// The read schema and branch for which the rules were compiled.
     binding: Option<(i64, Vec<crate::spec::DataField>, String)>,
+    /// Only a live, locally authorized read retains its verified snapshot.
+    snapshot: Option<std::sync::Arc<crate::spec::Snapshot>>,
     /// Historical reads can need NULL columns introduced after their snapshot.
     fields: Option<Vec<crate::spec::DataField>>,
     current_schema: Option<(i64, Vec<crate::spec::DataField>)>,
@@ -78,6 +80,7 @@ impl QueryAuthGrant {
             rules,
             response: None,
             binding: None,
+            snapshot: None,
             fields: None,
             current_schema: None,
         }
@@ -123,6 +126,11 @@ impl QueryAuthGrant {
             table.schema().fields().to_vec(),
             table.branch().into(),
         ));
+        if let Some(super::ReadSnapshot::Snapshot(snapshot, verified)) = &table.travel_snapshot {
+            if verified.get().is_some() {
+                self.snapshot = Some(snapshot.clone());
+            }
+        }
         self.fields = Some(fields);
         self.current_schema = Some((current.0, current.1.to_vec()));
         self
@@ -138,6 +146,22 @@ impl QueryAuthGrant {
         self.fields
             .as_deref()
             .unwrap_or_else(|| table.schema().fields())
+    }
+
+    /// The branch session identifies the catalog load even when the captured
+    /// read used a historical schema. The reader checks that schema and scope
+    /// separately before reusing the grant.
+    pub(super) fn branch_snapshot(&self, table: &super::Table) -> Option<&crate::spec::Snapshot> {
+        if table.query_auth_session() == Some(self.session)
+            && self
+                .binding
+                .as_ref()
+                .is_some_and(|(_, _, branch)| branch == table.branch())
+        {
+            self.snapshot.as_deref()
+        } else {
+            None
+        }
     }
 
     pub(crate) fn matches_table(&self, table: &super::Table) -> bool {

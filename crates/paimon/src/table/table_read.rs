@@ -303,23 +303,19 @@ impl<'a> TableRead<'a> {
         use super::query_auth::{historical_rule_fields, leaf_names, unsupported, QueryAuthGrant};
         let required = self.table().schema().core_options().query_auth_enabled()
             || splits.iter().any(DataSplit::query_auth_required);
-        if !required
-            || splits
-                .iter()
-                .all(|split| split.query_auth_grant().is_some())
-        {
+        if !required {
             return Ok(splits.to_vec());
         }
         if let Some(split) = splits.iter().find(|split| split.is_fallback()) {
-            let other = self
-                .table()
-                .fallback_read_table(split.snapshot_id(), required)
-                .await?;
+            let backup_auth = splits
+                .iter()
+                .any(|s| s.is_fallback() && s.query_auth_required());
+            let other = self.table().fallback_read_table(split, backup_auth).await?;
             let TableReadKind::Paimon(read) = &self.kind else {
                 return Err(unsupported("fallback splits require a Paimon table"));
             };
             let other_read = TableRead {
-                kind: TableReadKind::Paimon(read.for_fallback(&other)?),
+                kind: TableReadKind::Paimon(read.for_fallback(&other, backup_auth)?),
                 parallelism: self.parallelism,
                 ordered: self.ordered,
             };
@@ -328,14 +324,9 @@ impl<'a> TableRead<'a> {
                 .filter(|split| !split.is_fallback())
                 .cloned()
                 .collect();
-            let backup: Vec<_> = splits
-                .iter()
-                .filter(|split| split.is_fallback())
-                .cloned()
-                .map(|split| split.with_fallback(false).without_query_auth_grant())
-                .collect();
             let mut main = Box::pin(self.authorize_splits(&main)).await?.into_iter();
-            let mut backup = Box::pin(other_read.authorize_splits(&backup))
+            let mut backup = other_read
+                .authorize_fallback_splits(splits)
                 .await?
                 .into_iter();
             return Ok(splits
@@ -348,6 +339,12 @@ impl<'a> TableRead<'a> {
                     }
                 })
                 .collect());
+        }
+        if splits
+            .iter()
+            .all(|split| split.query_auth_grant().is_some())
+        {
+            return Ok(splits.to_vec());
         }
         let mut select: Vec<String> = self
             .read_type()
@@ -439,6 +436,48 @@ impl<'a> TableRead<'a> {
             .new_scan()
             .validate_transported_splits(&restored, grant)
             .await
+    }
+
+    /// Remove branch wrappers at the backup reader boundary. A grant can
+    /// survive this step only within the same catalog load and snapshot.
+    async fn authorize_fallback_splits(
+        &self,
+        splits: &[DataSplit],
+    ) -> crate::Result<Vec<DataSplit>> {
+        let TableReadKind::Paimon(read) = &self.kind else {
+            return Err(super::query_auth::unsupported(
+                "fallback splits require a Paimon table",
+            ));
+        };
+        let mut local: Vec<_> = splits
+            .iter()
+            .filter(|s| s.is_fallback())
+            .cloned()
+            .map(|s| s.with_fallback(false))
+            .collect();
+        let options = read.table.schema().core_options();
+        if !options.query_auth_enabled() && !local.iter().any(DataSplit::query_auth_required) {
+            return Ok(local);
+        }
+        let selected = read.table.travel_snapshot();
+        let same_snapshot = local.iter().all(|split| {
+            split
+                .query_auth_grant()
+                .and_then(|grant| grant.branch_snapshot(read.table))
+                .zip(selected)
+                .is_some_and(|(planned, selected)| {
+                    planned.id() == split.snapshot_id() && selected.has_same_read_metadata(planned)
+                })
+        });
+        if same_snapshot && read.ensure_authorized_by_splits(&options, &local).is_ok() {
+            return Ok(local);
+        }
+        // A different session, projection or serialized plan needs the full
+        // catalog and file-membership checks, including the captured rules.
+        for split in &mut local {
+            split.clear_query_auth_grant();
+        }
+        Box::pin(self.authorize_splits(&local)).await
     }
 
     /// Returns an [`ArrowRecordBatchStream`].
@@ -568,7 +607,11 @@ fn execution_parallelism(
 }
 
 impl<'a> PaimonTableRead<'a> {
-    fn for_fallback<'b>(&self, table: &'b Table) -> crate::Result<PaimonTableRead<'b>> {
+    fn for_fallback<'b>(
+        &self,
+        table: &'b Table,
+        backup_auth: bool,
+    ) -> crate::Result<PaimonTableRead<'b>> {
         let mut read = PaimonTableRead {
             table,
             read_type: super::fallback_read::read_fields(&self.read_type, self.table, table)?,
@@ -588,7 +631,7 @@ impl<'a> PaimonTableRead<'a> {
                 &table.schema().partition_fields(),
             )?;
         }
-        if table.schema().core_options().query_auth_enabled() {
+        if backup_auth || table.schema().core_options().query_auth_enabled() {
             // Main may have normalized this logical filter against raw partition
             // values. Backup must evaluate it on its own authorized, masked rows.
             if let Some(predicate) = read.partition_predicate.take() {
@@ -717,8 +760,9 @@ impl<'a> PaimonTableRead<'a> {
         // Preserve branch context and authorize the complete input before
         // each branch reader applies its partition predicate.
         let splits = splits.to_vec();
-        let query_auth_required = self.table.schema().core_options().query_auth_enabled()
-            || splits.iter().any(DataSplit::query_auth_required);
+        let backup_auth = splits
+            .iter()
+            .any(|s| s.is_fallback() && s.query_auth_required());
         let read_type = self.read_type.clone();
         let data_predicates = self.data_predicates.clone();
         let partition_predicate = self.partition_predicate.clone();
@@ -739,21 +783,19 @@ impl<'a> PaimonTableRead<'a> {
             .min((MAX_TOTAL_BLOB_READS / workers).max(1));
         let update_read = self.update_read;
         Ok(Box::pin(async_stream::try_stream! {
-            let snapshot_id = splits.iter().find(|split| split.is_fallback()).unwrap().snapshot_id();
-            let other = table.fallback_read_table(snapshot_id, query_auth_required).await?;
+            let backup_split = splits.iter().find(|split| split.is_fallback()).unwrap();
+            let other = table.fallback_read_table(backup_split, backup_auth).await?;
             let main_read = PaimonTableRead {
                 table: &table, read_type, data_predicates, partition_predicate,
                 row_filter_factory, parquet_read_budget: Some(Arc::clone(&budget)),
                 resources: None, data_file_read_timing, blob_parallelism, limit, update_read,
             };
-            let other_read = main_read.for_fallback(&other)?;
+            let other_read = main_read.for_fallback(&other, backup_auth)?;
             let main_splits: Vec<_> = splits.iter().filter(|s| !s.is_fallback()).cloned().collect();
-            let other_splits: Vec<_> = splits.iter().filter(|s| s.is_fallback())
-                .cloned().map(|s| s.with_fallback(false).without_query_auth_grant()).collect();
             let authorizer = TableRead {
                 kind: TableReadKind::Paimon(other_read.clone()), parallelism, ordered,
             };
-            let other_splits = authorizer.authorize_splits(&other_splits).await?;
+            let other_splits = authorizer.authorize_fallback_splits(&splits).await?;
             let mut restored = other_splits.iter();
             let splits: Vec<_> = splits.into_iter().map(|split| if split.is_fallback() {
                 restored.next().unwrap().clone().with_fallback(true)

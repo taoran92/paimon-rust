@@ -142,7 +142,7 @@ impl Table {
 
     pub(crate) async fn fallback_read_table(
         &self,
-        snapshot_id: i64,
+        split: &crate::DataSplit,
         query_auth_required: bool,
     ) -> Result<Table> {
         let other = self
@@ -161,10 +161,15 @@ impl Table {
             validate_schema(self, &other)?;
             return Ok(other);
         }
+        let snapshot_id = split.snapshot_id();
+        let planned = split
+            .query_auth_grant()
+            .and_then(|grant| grant.branch_snapshot(&other));
         let snapshot = match self
             .pinned_fallback_snapshot
             .get()
             .and_then(Option::as_deref)
+            .or(planned)
         {
             Some(snapshot) if snapshot.id() == snapshot_id => snapshot.clone(),
             _ => match other.snapshot_manager().get_snapshot(snapshot_id).await {

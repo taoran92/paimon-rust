@@ -5648,6 +5648,8 @@ async fn test_fallback_catalog_snapshot_time_mapping_and_latest_read() {
     let builder = fallback.new_read_builder();
     let read = builder.new_read().unwrap();
     let plan = builder.new_scan().plan().await.unwrap();
+    let requests = || g.ctx.server.auth_selects("default", branch).len();
+    let after_plan = requests();
     assert_eq!(
         ids(&read
             .to_arrow(plan.splits())
@@ -5657,6 +5659,11 @@ async fn test_fallback_catalog_snapshot_time_mapping_and_latest_read() {
             .unwrap()),
         [1, 2]
     );
+    assert_eq!(
+        requests(),
+        after_plan,
+        "planned splits already have a grant"
+    );
     let split = plan.splits().iter().find(|s| s.is_fallback()).unwrap();
     let transported =
         paimon::DataSplit::deserialize_split_v1(&split.serialize_split_v1().unwrap()).unwrap();
@@ -5664,6 +5671,11 @@ async fn test_fallback_catalog_snapshot_time_mapping_and_latest_read() {
         .authorize_splits(std::slice::from_ref(&transported))
         .await
         .unwrap();
+    let after_restore = requests();
+    assert!(
+        after_restore > after_plan,
+        "transported splits require a fresh grant"
+    );
     assert_eq!(
         ids(&read
             .to_arrow(&restored)
@@ -5673,7 +5685,23 @@ async fn test_fallback_catalog_snapshot_time_mapping_and_latest_read() {
             .unwrap()),
         [2]
     );
+    assert_eq!(
+        requests(),
+        after_restore,
+        "restored splits carry their live grant"
+    );
     serve(&second, time + 2);
+    // The same in-process plan still addresses its original branch snapshot.
+    assert_eq!(
+        ids(&read
+            .to_arrow(plan.splits())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap()),
+        [1, 2]
+    );
+    assert_eq!(requests(), after_restore);
     assert_eq!(ids(&read_all(&builder).await.unwrap()), [1, 2, 3]);
     assert!(matches!(
         read.authorize_splits(&[transported]).await,
